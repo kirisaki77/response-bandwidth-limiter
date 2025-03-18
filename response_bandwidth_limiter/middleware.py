@@ -2,9 +2,9 @@ from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 import asyncio
 from typing import Dict, Callable, Any, List, Optional
-from .errors import BandwidthLimitExceeded
+from .errors import ResponseBandwidthLimitExceeded
 
-class BandwidthLimiterMiddleware(BaseHTTPMiddleware):
+class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: Any, limits: Optional[Dict[str, int]] = None):
         """
         帯域制限ミドルウェア
@@ -40,10 +40,10 @@ class BandwidthLimiterMiddleware(BaseHTTPMiddleware):
         
         # アプリの状態からbandwidth_limitsまたはbandwidth_limiterを探す
         if app_state:
-            if hasattr(app_state, "bandwidth_limits"):
-                combined_limits.update(app_state.bandwidth_limits)
-            elif hasattr(app_state, "bandwidth_limiter") and hasattr(app_state.bandwidth_limiter, "routes"):
-                combined_limits.update(app_state.bandwidth_limiter.routes)
+            if hasattr(app_state, "response_bandwidth_limits"):
+                combined_limits.update(app_state.response_bandwidth_limits)
+            elif hasattr(app_state, "response_bandwidth_limiter") and hasattr(app_state.response_bandwidth_limiter, "routes"):
+                combined_limits.update(app_state.response_bandwidth_limiter.routes)
         
         # ルートを探索
         routes = getattr(app, "routes", [])
@@ -69,10 +69,10 @@ class BandwidthLimiterMiddleware(BaseHTTPMiddleware):
         
         # アプリの状態からbandwidth_limitsまたはbandwidth_limiterを探す
         if app_state:
-            if hasattr(app_state, "bandwidth_limits"):
-                combined_limits.update(app_state.bandwidth_limits)
-            elif hasattr(app_state, "bandwidth_limiter") and hasattr(app_state.bandwidth_limiter, "routes"):
-                combined_limits.update(app_state.bandwidth_limiter.routes)
+            if hasattr(app_state, "response_bandwidth_limits"):
+                combined_limits.update(app_state.response_bandwidth_limits)
+            elif hasattr(app_state, "response_bandwidth_limiter") and hasattr(app_state.response_bandwidth_limiter, "routes"):
+                combined_limits.update(app_state.response_bandwidth_limiter.routes)
         
         path = request.scope["path"]
         handler_name = self.get_handler_name(request, path)

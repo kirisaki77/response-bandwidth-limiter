@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bandwidth-limiter"
+name = "response-bandwidth-limiter"
 version = "0.1.0"
-description = "A simple bandwidth limitting extension for FastAPI"
+description = "A simple response bandwidth limiting extension for FastAPI and Starlette"
 readme = "README.md"
 authors = [
     {name = "kirisaki77", email = "110320276+kirisaki77@users.noreply.github.com"}
@@ -17,8 +17,22 @@ classifiers = [
 ]
 requires-python = ">=3.6"
 
+# 必須の依存関係（これがないとライブラリが動作しない）
+dependencies = [
+    "asyncio>=3.4.3",
+]
+
+[project.optional-dependencies]
+# 開発用依存関係（テスト、ドキュメント作成など）
+dev = [
+    "pytest>=6.0.0",
+    "httpx>=0.20.0",
+    "fastapi>=0.68.0",
+    "starlette>=0.14.0",
+]
+
 [project.urls]
-Homepage = "https://github.com/kirisaki77/bandwidth-limiter"
+Homepage = "https://github.com/kirisaki77/response-bandwidth-limiter"
 
 [tool.setuptools]
-packages = ["bandwidth_limiter"]
+packages = ["response_bandwidth_limiter"]

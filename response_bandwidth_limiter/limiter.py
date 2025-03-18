@@ -2,23 +2,23 @@ import functools
 from typing import Dict, Any, Callable, Optional, Union
 from fastapi import Request, FastAPI
 from starlette.applications import Starlette
-from .errors import BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler
-from .middleware import BandwidthLimiterMiddleware
+from .errors import ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler
+from .middleware import ResponseBandwidthLimiterMiddleware
 
-class BandwidthLimiter:
+class ResponseBandwidthLimiter:
     """
-    帯域幅制限の装飾子を提供するクラス
+    レスポンス帯域幅制限の装飾子を提供するクラス
     
     Example:
         ```
-        from bandwidth_limiter import BandwidthLimiter, _bandwidth_limit_exceeded_handler
-        from bandwidth_limiter.errors import BandwidthLimitExceeded
+        from response_bandwidth_limiter import ResponseBandwidthLimiter, _response_bandwidth_limit_exceeded_handler
+        from response_bandwidth_limiter.errors import ResponseBandwidthLimitExceeded
         from fastapi import FastAPI, Request
         
-        limiter = BandwidthLimiter()
+        limiter = ResponseBandwidthLimiter()
         app = FastAPI()
-        app.state.bandwidth_limiter = limiter
-        app.add_exception_handler(BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler)
+        app.state.response_bandwidth_limiter = limiter
+        app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler)
         
         @app.get("/download")
         @limiter.limit(1024)  # 1024 bytes/sec
@@ -72,6 +72,6 @@ class BandwidthLimiter:
         Args:
             app: FastAPIまたはStarletteアプリケーション
         """
-        app.state.bandwidth_limits = self.routes
-        app.add_middleware(BandwidthLimiterMiddleware)
-        app.add_exception_handler(BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler)
+        app.state.response_bandwidth_limits = self.routes
+        app.add_middleware(ResponseBandwidthLimiterMiddleware)
+        app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler)
