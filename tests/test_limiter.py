@@ -2,15 +2,15 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse
-from bandwidth_limiter import BandwidthLimiter, BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler
+from response_bandwidth_limiter import ResponseBandwidthLimiter, ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler
 import time
 
 # デコレータAPIのテスト
 def test_limiter_decorator():
     app = FastAPI()
-    limiter = BandwidthLimiter()
-    app.state.bandwidth_limiter = limiter
-    app.add_exception_handler(BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler)
+    limiter = ResponseBandwidthLimiter()
+    app.state.response_bandwidth_limiter = limiter
+    app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler)
     
     # 帯域制限付きエンドポイント (200 bytes/sec)
     @app.get("/test")
@@ -34,7 +34,7 @@ def test_limiter_decorator():
 
 # 不正な引数のテスト
 def test_invalid_limit_argument():
-    limiter = BandwidthLimiter()
+    limiter = ResponseBandwidthLimiter()
     
     # 文字列を渡すと例外が発生する
     with pytest.raises(TypeError):

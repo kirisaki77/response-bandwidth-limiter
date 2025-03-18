@@ -1,13 +1,29 @@
-# Bandwidth Limiter
+# Response Bandwidth Limiter
 
-FastAPIとStarlette用の帯域制限（レスポンス速度制限）ミドルウェア。特定のエンドポイントのレスポンス送信速度を制限することができます。
+FastAPIとStarlette用のレスポンス帯域制限ミドルウェア。特定のエンドポイントのレスポンス送信速度を制限することができます。
 
 ## インストール
 
 pipを使用してインストールできます：
 
 ```bash
-pip install bandwidth-limiter
+pip install response-bandwidth-limiter
+```
+
+### 依存関係
+
+このライブラリは最小限の依存関係で動作しますが、実際の使用にはFastAPIまたはStarletteが必要です。
+必要に応じて以下のようにインストールしてください：
+
+```bash
+# FastAPIと一緒に使用する場合
+pip install fastapi
+
+# Starletteと一緒に使用する場合
+pip install starlette
+
+# 開発やテストに必要な依存関係を含める場合
+pip install response-bandwidth-limiter[dev]
 ```
 
 ## 基本的な使い方
@@ -17,17 +33,17 @@ pip install bandwidth-limiter
 ```python
 from fastapi import FastAPI, Request
 from starlette.responses import FileResponse
-from bandwidth_limiter import BandwidthLimiter, BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler
+from response_bandwidth_limiter import ResponseBandwidthLimiter, ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler
 
 # リミッターの初期化
-limiter = BandwidthLimiter()
+limiter = ResponseBandwidthLimiter()
 app = FastAPI()
 
 # アプリケーションに登録
-app.state.bandwidth_limiter = limiter
-app.add_exception_handler(BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler)
+app.state.response_bandwidth_limiter = limiter
+app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler)
 
-# エンドポイントの帯域制限（1024 bytes/sec）
+# エンドポイントのレスポンス帯域制限（1024 bytes/sec）
 @app.get("/download")
 @limiter.limit(1024)  # 1024 bytes/sec
 async def download_file(request: Request):
@@ -44,13 +60,13 @@ async def stream_video(request: Request):
 
 ```python
 from fastapi import FastAPI
-from bandwidth_limiter import BandwidthLimiterMiddleware
+from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
 
 app = FastAPI()
 
 # エンドポイント名とbytes/secの対応を指定
 app.add_middleware(
-    BandwidthLimiterMiddleware, 
+    ResponseBandwidthLimiterMiddleware, 
     limits={
         "download_file": 1024,  # 1024 bytes/sec
         "stream_video": 2048,   # 2048 bytes/sec
@@ -72,10 +88,10 @@ async def stream_video():
 from starlette.applications import Starlette
 from starlette.responses import FileResponse
 from starlette.routing import Route
-from bandwidth_limiter import BandwidthLimiter, BandwidthLimiterMiddleware
+from response_bandwidth_limiter import ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware
 
 # デコレータ方式
-limiter = BandwidthLimiter()
+limiter = ResponseBandwidthLimiter()
 
 async def download_file(request):
     return FileResponse("path/to/large_file.txt")
@@ -95,21 +111,21 @@ limiter.init_app(app)
 
 # または直接ミドルウェアを使用
 app.add_middleware(
-    BandwidthLimiterMiddleware, 
+    ResponseBandwidthLimiterMiddleware, 
     limits={"download_file": 1024}
 )
 ```
 
 ## APIリファレンス
 
-### BandwidthLimiter
+### ResponseBandwidthLimiter
 
 帯域幅制限装飾子を提供するクラス。
 
 ```python
-from bandwidth_limiter import BandwidthLimiter
+from response_bandwidth_limiter import ResponseBandwidthLimiter
 
-limiter = BandwidthLimiter()
+limiter = ResponseBandwidthLimiter()
 ```
 
 #### メソッド
@@ -120,15 +136,15 @@ limiter = BandwidthLimiter()
 - **init_app(app: Union[FastAPI, Starlette]) -> None**  
   アプリケーションにリミッターを登録します。
 
-### BandwidthLimiterMiddleware
+### ResponseBandwidthLimiterMiddleware
 
 帯域制限を適用するミドルウェア。
 
 ```python
-from bandwidth_limiter import BandwidthLimiterMiddleware
+from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
 
 app.add_middleware(
-    BandwidthLimiterMiddleware, 
+    ResponseBandwidthLimiterMiddleware, 
     limits={"endpoint_name": rate_in_bytes_per_sec}
 )
 ```
@@ -138,21 +154,41 @@ app.add_middleware(
 帯域制限超過時に例外を発生させる場合は、例外ハンドラーを登録してください。
 
 ```python
-from bandwidth_limiter import BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler
+from response_bandwidth_limiter import ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler
 
-app.add_exception_handler(BandwidthLimitExceeded, _bandwidth_limit_exceeded_handler)
+app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler)
 ```
 
 ## 高度な使用例
+
+### デコレータを使った帯域制限の設定（シンプルなケース）
+
+シンプルに帯域制限を設定する場合は、`set_response_bandwidth_limit`デコレータを使用できます：
+
+```python
+from fastapi import FastAPI
+from starlette.responses import FileResponse
+from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware, set_response_bandwidth_limit
+
+app = FastAPI()
+app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+@app.get("/download")
+@set_response_bandwidth_limit(1024)  # 1024 bytes/sec
+async def download_file():
+    return FileResponse("path/to/large_file.txt")
+```
+
+この方法では、`ResponseBandwidthLimiter`クラスを初期化せずに、直接エンドポイントに帯域制限を設定できます。
 
 ### 動的な帯域制限
 
 実行時に帯域制限を変更したい場合：
 
 ```python
-limiter = BandwidthLimiter()
+limiter = ResponseBandwidthLimiter()
 app = FastAPI()
-app.state.bandwidth_limiter = limiter
+app.state.response_bandwidth_limiter = limiter
 
 @app.get("/admin/set-limit")
 async def set_limit(endpoint: str, limit: int):
