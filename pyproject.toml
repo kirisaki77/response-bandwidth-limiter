@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bandwidth-limiter"
+version = "0.1.0"
+description = "A simple bandwidth limitting extension for FastAPI"
+readme = "README.md"
+authors = [
+    {name = "kirisaki77", email = "110320276+kirisaki77@users.noreply.github.com"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.6"
+
+[project.urls]
+Homepage = "https://github.com/kirisaki77/bandwidth-limiter"
+
+[tool.setuptools]
+packages = ["bandwidth_limiter"]
