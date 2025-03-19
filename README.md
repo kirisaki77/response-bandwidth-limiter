@@ -84,36 +84,6 @@ app = Starlette(routes=routes)
 limiter.init_app(app)
 ```
 
-## APIリファレンス
-
-### ResponseBandwidthLimiter
-
-帯域幅制限装飾子を提供するクラス。
-
-```python
-from response_bandwidth_limiter import ResponseBandwidthLimiter
-
-limiter = ResponseBandwidthLimiter()
-```
-
-#### メソッド
-
-- **limit(rate: int) -> Callable**  
-  帯域幅を制限するデコレータ。bytes/secの整数値を指定します。
-
-- **init_app(app: Union[FastAPI, Starlette]) -> None**  
-  アプリケーションにリミッターを登録します。
-
-### 例外処理
-
-帯域制限超過時に例外を発生させる場合は、例外ハンドラーを登録してください。
-
-```python
-from response_bandwidth_limiter import ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler
-
-app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler)
-```
-
 ## 高度な使用例
 
 ### デコレータを使った帯域制限の設定（シンプルなケース）
@@ -240,10 +210,164 @@ async def download_for_user(request: Request, user_id: str):
 - 大きなファイル転送の場合は、メモリ使用量に注意してください。
 - 分散システムの場合、各サーバーごとに制限が適用されます。
 
+## APIリファレンス
+
+このセクションでは、ライブラリが提供する主なクラスとメソッドの詳細なリファレンスを提供します。
+
+### ResponseBandwidthLimiter
+
+レスポンス帯域制限の機能を提供するメインクラスです。
+
+```python
+class ResponseBandwidthLimiter:
+    def __init__(self, key_func=None):
+        """
+        レスポンス帯域幅制限機能を初期化します
+        
+        引数:
+            key_func: 将来的な拡張用のキー関数（現在は使用されていません）
+        """
+        
+    def limit(self, rate: int):
+        """
+        エンドポイントに対して帯域制限を適用するデコレータを返します
+        
+        引数:
+            rate: 制限する速度（bytes/sec）
+            
+        戻り値:
+            デコレータ関数
+            
+        例外:
+            TypeError: rateが整数でない場合
+        """
+        
+    def init_app(self, app):
+        """
+        FastAPIまたはStarletteアプリケーションにリミッターを登録します
+        
+        引数:
+            app: FastAPIまたはStarletteアプリケーションインスタンス
+        """
+```
+
+### ResponseBandwidthLimiterMiddleware
+
+FastAPIおよびStarlette用のミドルウェアで、帯域制限を実際に適用します。
+
+```python
+class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app):
+        """
+        帯域制限ミドルウェアを初期化します
+        
+        引数:
+            app: FastAPIまたはStarletteアプリケーション
+        """
+        
+    def get_handler_name(self, request, path):
+        """
+        パスに一致するハンドラー名を取得します
+        
+        引数:
+            request: リクエストオブジェクト
+            path: リクエストパス
+            
+        戻り値:
+            str または None: エンドポイント名（存在する場合）
+        """
+        
+    async def dispatch(self, request, call_next):
+        """
+        リクエストに対して帯域制限を適用します
+        
+        引数:
+            request: リクエストオブジェクト
+            call_next: 次のミドルウェア関数
+            
+        戻り値:
+            レスポンスオブジェクト
+        """
+```
+
+### set_response_bandwidth_limit
+
+シンプルな帯域制限デコレータです。
+
+```python
+def set_response_bandwidth_limit(limit: int):
+    """
+    エンドポイントごとに帯域制限を設定するシンプルなデコレータ
+    
+    引数:
+        limit: 制限する速度（bytes/sec）
+        
+    戻り値:
+        デコレータ関数
+    """
+```
+
+### ResponseBandwidthLimitExceeded
+
+帯域制限超過時に発生する例外です。
+
+```python
+class ResponseBandwidthLimitExceeded(Exception):
+    """
+    帯域幅の制限を超過した場合に発生する例外
+    
+    引数:
+        limit: 制限値（bytes/sec）
+        endpoint: 制限が適用されたエンドポイント名
+    """
+```
+
+### エラーハンドラ
+
+```python
+async def _response_bandwidth_limit_exceeded_handler(request, exc):
+    """
+    帯域幅制限超過時のエラーハンドラー
+    
+    引数:
+        request: リクエストオブジェクト
+        exc: ResponseBandwidthLimitExceeded例外
+        
+    戻り値:
+        JSONResponse: HTTPステータスコード429と説明
+    """
+```
+
+### ユーティリティ関数
+
+```python
+def get_endpoint_name(request):
+    """
+    リクエストからエンドポイント名を取得します
+    
+    引数:
+        request: リクエストオブジェクト
+    
+    戻り値:
+        str: エンドポイント名
+    """
+    
+def get_route_path(request):
+    """
+    リクエストからルートパスを取得します
+    
+    引数:
+        request: リクエストオブジェクト
+        
+    戻り値:
+        str: ルートパス
+    """
+```
+
 ## 謝辞
 
 このライブラリは [slowapi](https://github.com/laurentS/slowapi) (MIT Licensed) にインスパイアされました。
 
 ## ライセンス
 
-MIT
+MPL-2.0
