@@ -3,18 +3,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import asyncio
 from typing import Dict, Callable, Any, List, Optional
 from .errors import ResponseBandwidthLimitExceeded
+from .decorator import endpoint_bandwidth_limits
 
 class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: Any, limits: Optional[Dict[str, int]] = None):
+    def __init__(self, app: Any):
         """
         帯域制限ミドルウェア
         
         Args:
             app: FastAPIまたはStarletteアプリ
-            limits: エンドポイント名と制限速度(bytes/sec)の辞書
         """
         super().__init__(app)
-        self.endpoint_bandwidth_limits = limits or {}
+        self.endpoint_bandwidth_limits = {}
         
     def get_routes(self) -> List[Any]:
         """アプリケーションからルート情報を取得"""
@@ -36,6 +36,7 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
         
         # 帯域制限を取得
         combined_limits = self.endpoint_bandwidth_limits.copy()
+        combined_limits.update(endpoint_bandwidth_limits)  # decorator.pyからの制限を追加
         app_state = getattr(app, "state", None)
         
         # アプリの状態からbandwidth_limitsまたはbandwidth_limiterを探す
@@ -49,13 +50,30 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
         routes = getattr(app, "routes", [])
         for route in routes:
             if hasattr(route, "path") and route.path == path:
-                if hasattr(route, "name") and route.name in combined_limits:
-                    return route.name
-                # FastAPIのエンドポイント関数名を確認
+                # まず関数名で確認
                 if hasattr(route, "endpoint") and hasattr(route.endpoint, "__name__"):
                     endpoint_name = route.endpoint.__name__
                     if endpoint_name in combined_limits:
                         return endpoint_name
+                
+                # ルート名で確認
+                if hasattr(route, "name") and route.name in combined_limits:
+                    return route.name
+                
+                # FastAPIではルートにname属性が設定されていない場合があるので、
+                # pathからルート名を取得してみる（"/fast" → "fast"）
+                route_name = path.strip("/")
+                if route_name in combined_limits:
+                    return route_name
+                
+                # エンドポイント関数名から"_response"などのサフィックスを取り除いた名前も確認
+                if hasattr(route, "endpoint") and hasattr(route.endpoint, "__name__"):
+                    base_name = route.endpoint.__name__
+                    for suffix in ["_response", "_endpoint"]:
+                        if base_name.endswith(suffix):
+                            base_name = base_name[:-len(suffix)]
+                            if base_name in combined_limits:
+                                return base_name
         return None
 
     async def dispatch(self, request: Request, call_next):
@@ -65,6 +83,7 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
         
         # 帯域制限を取得
         combined_limits = self.endpoint_bandwidth_limits.copy()
+        combined_limits.update(endpoint_bandwidth_limits)  # decorator.pyからの制限を追加
         app_state = getattr(app, "state", None)
         
         # アプリの状態からbandwidth_limitsまたはbandwidth_limiterを探す
@@ -98,5 +117,8 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
             response.body_iterator = limited_iterator(original_iterator)
         elif hasattr(response, "streaming"):
             response.streaming = limited_iterator(response.streaming)
+
+        print(f"帯域制限を適用: {handler_name} ({max_rate} bytes/sec)")
+        print(response)
 
         return response

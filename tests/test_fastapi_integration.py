@@ -70,22 +70,4 @@ def test_fastapi_streaming_response():
     assert "data_packet0".encode("utf-8") in content
     assert "data_packet4".encode("utf-8") in content
 
-# FastAPIのミドルウェア直接使用テスト
-def test_fastapi_middleware_direct():
-    app = FastAPI()
-    
-    @app.get("/test")
-    async def test_endpoint():
-        return PlainTextResponse("test" * 50)
-    
-    # 直接ミドルウェアを指定してルート制限
-    app.add_middleware(
-        ResponseBandwidthLimiterMiddleware,
-        limits={"test_endpoint": 200}
-    )
-    
-    client = TestClient(app)
-    response = client.get("/test")
-    
-    assert response.status_code == 200
-    assert len(response.content) == 200  # "test" * 50 = 200バイト
+# ミドルウェア直接使用テストを削除

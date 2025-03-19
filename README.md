@@ -56,39 +56,13 @@ async def stream_video(request: Request):
     return FileResponse("path/to/video.mp4")
 ```
 
-### ミドルウェアを直接使う方法
-
-```python
-from fastapi import FastAPI
-from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
-
-app = FastAPI()
-
-# エンドポイント名とbytes/secの対応を指定
-app.add_middleware(
-    ResponseBandwidthLimiterMiddleware, 
-    limits={
-        "download_file": 1024,  # 1024 bytes/sec
-        "stream_video": 2048,   # 2048 bytes/sec
-    }
-)
-
-@app.get("/download")
-async def download_file():
-    return FileResponse("path/to/large_file.txt")
-
-@app.get("/video")
-async def stream_video():
-    return FileResponse("path/to/video.mp4")
-```
-
 ### Starletteでの使用例
 
 ```python
 from starlette.applications import Starlette
 from starlette.responses import FileResponse
 from starlette.routing import Route
-from response_bandwidth_limiter import ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware
+from response_bandwidth_limiter import ResponseBandwidthLimiter
 
 # デコレータ方式
 limiter = ResponseBandwidthLimiter()
@@ -108,12 +82,6 @@ app = Starlette(routes=routes)
 
 # リミッターをアプリに登録
 limiter.init_app(app)
-
-# または直接ミドルウェアを使用
-app.add_middleware(
-    ResponseBandwidthLimiterMiddleware, 
-    limits={"download_file": 1024}
-)
 ```
 
 ## APIリファレンス
@@ -136,19 +104,6 @@ limiter = ResponseBandwidthLimiter()
 - **init_app(app: Union[FastAPI, Starlette]) -> None**  
   アプリケーションにリミッターを登録します。
 
-### ResponseBandwidthLimiterMiddleware
-
-帯域制限を適用するミドルウェア。
-
-```python
-from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
-
-app.add_middleware(
-    ResponseBandwidthLimiterMiddleware, 
-    limits={"endpoint_name": rate_in_bytes_per_sec}
-)
-```
-
 ### 例外処理
 
 帯域制限超過時に例外を発生させる場合は、例外ハンドラーを登録してください。
@@ -168,10 +123,9 @@ app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_li
 ```python
 from fastapi import FastAPI
 from starlette.responses import FileResponse
-from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware, set_response_bandwidth_limit
+from response_bandwidth_limiter import set_response_bandwidth_limit
 
 app = FastAPI()
-app.add_middleware(ResponseBandwidthLimiterMiddleware)
 
 @app.get("/download")
 @set_response_bandwidth_limit(1024)  # 1024 bytes/sec
@@ -180,6 +134,69 @@ async def download_file():
 ```
 
 この方法では、`ResponseBandwidthLimiter`クラスを初期化せずに、直接エンドポイントに帯域制限を設定できます。
+さらに、このデコレータを使用する場合は、ミドルウェアを明示的に追加する必要があります：
+
+```python
+from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
+
+app = FastAPI()
+app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+@app.get("/download")
+@set_response_bandwidth_limit(1024)
+async def download_file():
+    return FileResponse("path/to/large_file.txt")
+```
+
+このシンプルなデコレータはグローバルな設定を使用するため、複数のアプリケーションで同じ関数名を使用する場合は注意してください。より複雑なシナリオでは、`ResponseBandwidthLimiter`クラスを使用するアプローチが推奨されます。
+
+### シンプルデコレータと標準デコレータの違い
+
+シンプルデコレータ (`set_response_bandwidth_limit`) と標準デコレータ (`ResponseBandwidthLimiter.limit`) の主な違い：
+
+1. シンプルデコレータ:
+   - グローバルな設定を使用
+   - アプリインスタンスに依存しない
+   - 複数アプリで同名の関数を使うと競合する可能性あり
+   - 設定が簡単
+
+2. 標準デコレータ:
+   - アプリインスタンスごとに分離された設定
+   - 複数のアプリで安全に使用可能
+   - より明示的な初期化が必要
+   - 大規模アプリに適している
+
+### 両方のデコレータを併用する
+
+同じアプリ内で両方のデコレータを使用することもできます：
+
+```python
+from fastapi import FastAPI, Request
+from response_bandwidth_limiter import (
+    ResponseBandwidthLimiter,
+    set_response_bandwidth_limit,
+    ResponseBandwidthLimiterMiddleware
+)
+
+app = FastAPI()
+limiter = ResponseBandwidthLimiter()
+app.state.response_bandwidth_limiter = limiter
+
+# ミドルウェアは一度だけ追加
+app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+# 標準デコレータの使用例
+@app.get("/video")
+@limiter.limit(2048)
+async def stream_video(request: Request):
+    # ...
+
+# シンプルデコレータの使用例
+@app.get("/download")
+@set_response_bandwidth_limit(1024)
+async def download_file(request: Request):
+    # ...
+```
 
 ### 動的な帯域制限
 
