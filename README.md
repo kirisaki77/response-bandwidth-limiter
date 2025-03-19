@@ -240,6 +240,10 @@ async def download_for_user(request: Request, user_id: str):
 - 大きなファイル転送の場合は、メモリ使用量に注意してください。
 - 分散システムの場合、各サーバーごとに制限が適用されます。
 
+## 謝辞
+
+このライブラリは [slowapi](https://github.com/laurentS/slowapi) (MIT Licensed) にインスパイアされました。
+
 ## ライセンス
 
 MIT
