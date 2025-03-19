@@ -6,7 +6,6 @@ from starlette.testclient import TestClient
 from response_bandwidth_limiter import (
     ResponseBandwidthLimiter,
     ResponseBandwidthLimiterMiddleware,
-    StarletteResponseBandwidthLimiterMiddleware,
 )
 import time
 import asyncio
@@ -75,26 +74,3 @@ def test_starlette_streaming_response():
     content = response.content
     assert "data_packet0".encode("utf-8") in content
     assert "data_packet4".encode("utf-8") in content
-
-# Starlette専用ミドルウェアのテスト
-def test_starlette_specific_middleware():
-    async def test_endpoint(request):
-        return PlainTextResponse("test" * 50)
-    
-    routes = [
-        Route("/test", endpoint=test_endpoint, name="test_route"),
-    ]
-    
-    app = Starlette(routes=routes)
-    
-    # Starlette専用ミドルウェアを使用
-    app.add_middleware(
-        StarletteResponseBandwidthLimiterMiddleware, 
-        limits={"test_route": 200}
-    )
-    
-    client = TestClient(app)
-    response = client.get("/test")
-    
-    assert response.status_code == 200
-    assert len(response.content) == 200  # "test" * 50 = 200バイト
