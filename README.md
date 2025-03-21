@@ -364,6 +364,11 @@ def get_route_path(request):
     """
 ```
 
+## ソースコード
+
+このライブラリのソースコードは以下のGitHubリポジトリで公開されています：
+https://github.com/kirisaki77/response-bandwidth-limiter
+
 ## 謝辞
 
 このライブラリは [slowapi](https://github.com/laurentS/slowapi) (MIT Licensed) にインスパイアされました。
@@ -371,3 +376,7 @@ def get_route_path(request):
 ## ライセンス
 
 MPL-2.0
+
+## PyPI
+
+https://pypi.org/project/response-bandwidth-limiter/
