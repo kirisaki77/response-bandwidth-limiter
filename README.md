@@ -1,8 +1,5 @@
 # Response Bandwidth Limiter
 
-> ⚠ **注意: このプロジェクトは実験段階です。**  
-> 商用環境での利用は推奨しません。
-
 FastAPIとStarlette用のレスポンス帯域制限ミドルウェア。特定のエンドポイントのレスポンス送信速度を制限することができます。
 
 ## インストール
@@ -367,6 +364,11 @@ def get_route_path(request):
     """
 ```
 
+## ソースコード
+
+このライブラリのソースコードは以下のGitHubリポジトリで公開されています：
+https://github.com/kirisaki77/response-bandwidth-limiter
+
 ## 謝辞
 
 このライブラリは [slowapi](https://github.com/laurentS/slowapi) (MIT Licensed) にインスパイアされました。
@@ -374,3 +376,7 @@ def get_route_path(request):
 ## ライセンス
 
 MPL-2.0
+
+## PyPI
+
+https://pypi.org/project/response-bandwidth-limiter/
