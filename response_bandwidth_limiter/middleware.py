@@ -118,7 +118,4 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
         elif hasattr(response, "streaming"):
             response.streaming = limited_iterator(response.streaming)
 
-        print(f"帯域制限を適用: {handler_name} ({max_rate} bytes/sec)")
-        print(response)
-
         return response
