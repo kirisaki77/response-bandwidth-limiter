@@ -7,11 +7,10 @@ from response_bandwidth_limiter import (
     ResponseBandwidthLimiter,
     ResponseBandwidthLimiterMiddleware,
 )
-import time
 import asyncio
 
 # Starletteの基本統合テスト
-def test_starlette_basic_integration():
+def test_starlette_basic_integration(recorded_limit_calls):
     limiter = ResponseBandwidthLimiter()
     
     async def slow_endpoint(request):
@@ -45,9 +44,10 @@ def test_starlette_basic_integration():
     
     # 設定の検証
     assert "slow_endpoint" in limiter.routes
+    assert [call["rate"] for call in recorded_limit_calls] == [100]
 
 # Starletteのストリーミングレスポンステスト
-def test_starlette_streaming_response():
+def test_starlette_streaming_response(recorded_limit_calls):
     limiter = ResponseBandwidthLimiter()
     
     async def number_generator():
@@ -74,3 +74,4 @@ def test_starlette_streaming_response():
     content = response.content
     assert "data_packet0".encode("utf-8") in content
     assert "data_packet4".encode("utf-8") in content
+    assert [call["rate"] for call in recorded_limit_calls] == [100] * 5

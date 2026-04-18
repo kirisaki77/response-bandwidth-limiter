@@ -6,11 +6,10 @@ from starlette.routing import Route
 from fastapi.testclient import TestClient
 from starlette.testclient import TestClient as StarletteTestClient
 from response_bandwidth_limiter import ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware
-import time
 
 
 # FastAPIでの動的帯域制限テスト
-def test_fastapi_dynamic_bandwidth_limit():
+def test_fastapi_dynamic_bandwidth_limit(recorded_limit_calls):
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
     app.state.response_bandwidth_limiter = limiter
@@ -37,45 +36,31 @@ def test_fastapi_dynamic_bandwidth_limit():
     # エンドポイント名を設定
     limiter.routes["get_data"] = initial_limit
     
-    # 初期制限での応答時間を計測
-    start_time = time.time()
     response = client.get("/data")
-    initial_elapsed = time.time() - start_time
     
     # レスポンス内容の検証
     assert response.status_code == 200
     assert len(response.content) == data_size
-    
-    print(f"初期制限({initial_limit}b/s)での応答時間: {initial_elapsed:.2f}秒")
+    assert [call["rate"] for call in recorded_limit_calls] == [initial_limit]
     
     # 制限値を動的に変更
     client.get(f"/admin/set-limit?endpoint=get_data&limit={new_limit}")
     
     # 制限値が変更されたことを確認
     assert limiter.routes["get_data"] == new_limit
-    
-    # 変更後の制限での応答時間を計測
-    start_time = time.time()
+
+    recorded_limit_calls.clear()
     response = client.get("/data")
-    new_elapsed = time.time() - start_time
     
     # レスポンス内容の検証
     assert response.status_code == 200
     assert len(response.content) == data_size
-    
-    print(f"変更後制限({new_limit}b/s)での応答時間: {new_elapsed:.2f}秒")
-    
-    # 応答時間の比較（理論上は初期制限の方が約10倍速い）
-    expected_ratio = initial_limit / new_limit
-    actual_ratio = new_elapsed / initial_elapsed if initial_elapsed > 0 else 1
-    
-    # テスト環境の不確実性を考慮した緩い条件
-    assert actual_ratio > 1.5, f"動的制限変更が期待通り機能していません。初期: {initial_elapsed:.2f}秒, 変更後: {new_elapsed:.2f}秒, 比率: {actual_ratio:.2f}"
-    print(f"速度比: {actual_ratio:.2f} (理論値: {expected_ratio:.2f})")
+
+    assert [call["rate"] for call in recorded_limit_calls] == [new_limit]
 
 
 # Starletteでの動的帯域制限テスト
-def test_starlette_dynamic_bandwidth_limit():
+def test_starlette_dynamic_bandwidth_limit(recorded_limit_calls):
     limiter = ResponseBandwidthLimiter()
     
     data_size = 10000  # 10KBのデータ
@@ -116,45 +101,31 @@ def test_starlette_dynamic_bandwidth_limit():
     # エンドポイント名を設定
     limiter.routes["get_data"] = initial_limit
     
-    # 初期制限での応答時間を計測
-    start_time = time.time()
     response = client.get("/data")
-    initial_elapsed = time.time() - start_time
     
     # レスポンス内容の検証
     assert response.status_code == 200
     assert len(response.content) == data_size
-    
-    print(f"Starlette初期制限({initial_limit}b/s)での応答時間: {initial_elapsed:.2f}秒")
+    assert [call["rate"] for call in recorded_limit_calls] == [initial_limit]
     
     # 制限値を動的に変更
     client.get(f"/admin/set-limit?endpoint=get_data&limit={new_limit}")
     
     # 制限値が変更されたことを確認
     assert limiter.routes["get_data"] == new_limit
-    
-    # 変更後の制限での応答時間を計測
-    start_time = time.time()
+
+    recorded_limit_calls.clear()
     response = client.get("/data")
-    new_elapsed = time.time() - start_time
     
     # レスポンス内容の検証
     assert response.status_code == 200
     assert len(response.content) == data_size
-    
-    print(f"Starlette変更後制限({new_limit}b/s)での応答時間: {new_elapsed:.2f}秒")
-    
-    # 応答時間の比較
-    expected_ratio = initial_limit / new_limit
-    actual_ratio = new_elapsed / initial_elapsed if initial_elapsed > 0 else 1
-    
-    # テスト環境の不確実性を考慮した緩い条件
-    assert actual_ratio > 1.5, f"Starletteでの動的制限変更が期待通り機能していません。初期: {initial_elapsed:.2f}秒, 変更後: {new_elapsed:.2f}秒, 比率: {actual_ratio:.2f}"
-    print(f"Starlette速度比: {actual_ratio:.2f} (理論値: {expected_ratio:.2f})")
+
+    assert [call["rate"] for call in recorded_limit_calls] == [new_limit]
 
 
 # ストリーミングレスポンスでの動的帯域制限テスト
-def test_streaming_dynamic_bandwidth_limit():
+def test_streaming_dynamic_bandwidth_limit(recorded_limit_calls):
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
     app.state.response_bandwidth_limiter = limiter
@@ -189,38 +160,24 @@ def test_streaming_dynamic_bandwidth_limit():
     # エンドポイント名を設定
     limiter.routes["stream_data"] = initial_limit
     
-    # 初期制限での応答時間を計測
-    start_time = time.time()
     response = client.get("/stream")
-    initial_elapsed = time.time() - start_time
     
     # レスポンス内容の検証
     assert response.status_code == 200
     assert len(response.content) == chunk_size * chunks
-    
-    print(f"ストリーミング初期制限({initial_limit}b/s)での応答時間: {initial_elapsed:.2f}秒")
+    assert [call["rate"] for call in recorded_limit_calls] == [initial_limit] * chunks
     
     # 制限値を動的に変更
     client.get(f"/admin/set-stream-limit?limit={new_limit}")
     
     # 制限値が変更されたことを確認
     assert limiter.routes["stream_data"] == new_limit
-    
-    # 変更後の制限での応答時間を計測
-    start_time = time.time()
+
+    recorded_limit_calls.clear()
     response = client.get("/stream")
-    new_elapsed = time.time() - start_time
     
     # レスポンス内容の検証
     assert response.status_code == 200
     assert len(response.content) == chunk_size * chunks
-    
-    print(f"ストリーミング変更後制限({new_limit}b/s)での応答時間: {new_elapsed:.2f}秒")
-    
-    # 応答時間の比較
-    expected_ratio = initial_limit / new_limit
-    actual_ratio = new_elapsed / initial_elapsed if initial_elapsed > 0 else 1
-    
-    # テスト環境の不確実性を考慮した緩い条件
-    assert actual_ratio > 1.5, f"ストリーミングでの動的制限変更が期待通り機能していません。初期: {initial_elapsed:.2f}秒, 変更後: {new_elapsed:.2f}秒, 比率: {actual_ratio:.2f}"
-    print(f"ストリーミング速度比: {actual_ratio:.2f} (理論値: {expected_ratio:.2f})")
+
+    assert [call["rate"] for call in recorded_limit_calls] == [new_limit] * chunks

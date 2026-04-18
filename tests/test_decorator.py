@@ -9,7 +9,6 @@ from response_bandwidth_limiter import (
     endpoint_bandwidth_limits,
     ResponseBandwidthLimiterMiddleware,
 )
-import time
 
 # デコレータの基本的なテスト
 def test_decorator_sets_limit():
@@ -56,8 +55,22 @@ def test_decorator_rejects_non_positive_limit():
         async def negative_limit(request):
             return PlainTextResponse("test")
 
+
+def test_decorator_rejects_non_integer_limit():
+    endpoint_bandwidth_limits.clear()
+
+    with pytest.raises(TypeError):
+        @set_response_bandwidth_limit("100")
+        async def string_limit(request):
+            return PlainTextResponse("test")
+
+    with pytest.raises(TypeError):
+        @set_response_bandwidth_limit(1.5)
+        async def float_limit(request):
+            return PlainTextResponse("test")
+
 # FastAPIとの統合テスト
-def test_fastapi_decorator_integration():
+def test_fastapi_decorator_integration(recorded_limit_calls):
     # テスト前に既存の値をクリア
     endpoint_bandwidth_limits.clear()
     
@@ -75,32 +88,20 @@ def test_fastapi_decorator_integration():
         return PlainTextResponse("b" * 5000)
     
     client = TestClient(app)
-    
-    # 速度測定とレスポンス検証
-    start_time = time.time()
+
     slow_response = client.get("/slow-endpoint")
-    slow_elapsed = time.time() - start_time
-    
-    start_time = time.time()
     fast_response = client.get("/fast-endpoint")
-    fast_elapsed = time.time() - start_time
     
     # レスポンス内容の検証
     assert slow_response.status_code == 200
     assert len(slow_response.content) == 5000
     assert fast_response.status_code == 200
     assert len(fast_response.content) == 5000
-    
-    # 速度比の検証（厳密なタイミングは環境依存なので緩めの条件で）
-    expected_ratio = 5000 / 100  # 理論上の比率
-    actual_ratio = slow_elapsed / fast_elapsed if fast_elapsed > 0 else 1
-    
-    # テスト環境の不確実性を考慮した緩めの条件
-    assert actual_ratio > 1.5, f"速度制限の差が期待より小さい。高速: {fast_elapsed:.2f}秒, 低速: {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f}"
-    print(f"デコレータ帯域制限の効果: 高速(5000b/s): {fast_elapsed:.2f}秒, 低速(100b/s): {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f}")
+
+    assert [call["rate"] for call in recorded_limit_calls] == [100, 5000]
 
 # Starletteとの統合テスト
-def test_starlette_decorator_integration():
+def test_starlette_decorator_integration(recorded_limit_calls):
     # テスト前に既存の値をクリア
     endpoint_bandwidth_limits.clear()
     
@@ -121,26 +122,14 @@ def test_starlette_decorator_integration():
     app.add_middleware(ResponseBandwidthLimiterMiddleware)
     
     client = TestClient(app)
-    
-    # 速度測定とレスポンス検証
-    start_time = time.time()
+
     slow_response = client.get("/slow")
-    slow_elapsed = time.time() - start_time
-    
-    start_time = time.time()
     fast_response = client.get("/fast")
-    fast_elapsed = time.time() - start_time
     
     # レスポンス検証
     assert slow_response.status_code == 200
     assert len(slow_response.content) == 5000
     assert fast_response.status_code == 200
     assert len(fast_response.content) == 5000
-    
-    # 速度比の検証
-    expected_ratio = 5000 / 100  # 理論上の比率
-    actual_ratio = slow_elapsed / fast_elapsed if fast_elapsed > 0 else 1
-    
-    # テスト環境の不確実性を考慮した緩めの条件
-    assert actual_ratio > 1.5, f"Starletteでの速度制限の差が期待より小さい。高速: {fast_elapsed:.2f}秒, 低速: {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f}"
-    print(f"Starletteデコレータ帯域制限の効果: 高速(5000b/s): {fast_elapsed:.2f}秒, 低速(100b/s): {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f}")
+
+    assert [call["rate"] for call in recorded_limit_calls] == [100, 5000]

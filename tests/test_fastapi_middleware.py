@@ -3,11 +3,10 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse, StreamingResponse
 from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule, Throttle
-import time
 import asyncio
 
 # FastAPIのミドルウェアテスト
-def test_fastapi_middleware():
+def test_fastapi_middleware(recorded_limit_calls):
     app = FastAPI()
     
     # 帯域制限を追加 (100 bytes/sec)
@@ -25,9 +24,10 @@ def test_fastapi_middleware():
     # ベーシックな検証
     assert response.status_code == 200
     assert len(response.content) == 300
+    assert [call["rate"] for call in recorded_limit_calls] == [100]
 
 # 帯域制限の実効性テスト
-def test_bandwidth_limit_effectiveness():
+def test_bandwidth_limit_effectiveness(recorded_limit_calls):
     app = FastAPI()
     
     # 大きめの帯域制限を設定 (5000 bytes/sec)
@@ -53,33 +53,18 @@ def test_bandwidth_limit_effectiveness():
         return PlainTextResponse("b" * data_size)
     
     client = TestClient(app)
-    
-    # 高速レスポンスの時間計測
-    start_time = time.time()
+
     fast_response = client.get("/fast")
-    fast_elapsed = time.time() - start_time
-    
-    # 低速レスポンスの時間計測
-    start_time = time.time()
     slow_response = client.get("/slow")
-    slow_elapsed = time.time() - start_time
     
     # 両方のレスポンスが完全に受信されていることを確認
     assert len(fast_response.content) == data_size
     assert len(slow_response.content) == data_size
-    
-    # 低速レスポンスは高速レスポンスより時間がかかるはず
-    # 正確な時間は保証できないが、オーダーの差があるはず
-    expected_ratio = fast_limit / slow_limit  # 理論上の比率
-    actual_ratio = slow_elapsed / fast_elapsed if fast_elapsed > 0 else 1
-    
-    # テスト環境の不確実性を考慮して、緩めの条件で検証
-    # 少なくとも制限の差の半分程度は反映されているべき
-    assert actual_ratio > (expected_ratio * 0.5), f"速度制限が期待通り機能していません。高速: {fast_elapsed:.2f}秒, 低速: {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f} (期待: >{expected_ratio * 0.5:.2f})"
-    print(f"帯域制限の効果を確認: 高速({fast_limit}b/s): {fast_elapsed:.2f}秒, 低速({slow_limit}b/s): {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f}")
+
+    assert [call["rate"] for call in recorded_limit_calls] == [fast_limit, slow_limit]
 
 # ストリーミングレスポンスでの帯域制限テスト
-def test_streaming_bandwidth_limit():
+def test_streaming_bandwidth_limit(recorded_limit_calls):
     app = FastAPI()
     
     # 異なる帯域制限を設定
@@ -110,27 +95,31 @@ def test_streaming_bandwidth_limit():
         return StreamingResponse(slow_generator())
     
     client = TestClient(app)
-    
-    # 時間計測
-    start_time = time.time()
+
     fast_response = client.get("/fast-stream")
-    fast_elapsed = time.time() - start_time
-    
-    start_time = time.time()
     slow_response = client.get("/slow-stream")
-    slow_elapsed = time.time() - start_time
     
     # レスポンスデータの検証
     assert len(fast_response.content) == chunk_size * chunks
     assert len(slow_response.content) == chunk_size * chunks
-    
-    # 速度比の検証
-    expected_ratio = 2000 / 500  # 理論上の比率
-    actual_ratio = slow_elapsed / fast_elapsed if fast_elapsed > 0 else 1
-    
-    # テスト環境を考慮した緩めの条件
-    assert actual_ratio > 1.5, f"ストリーミングでの速度制限が期待通り機能していません。比率: {actual_ratio:.2f}"
-    print(f"ストリーミング帯域制限の効果: 高速: {fast_elapsed:.2f}秒, 低速: {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f}")
+
+    assert [call["rate"] for call in recorded_limit_calls] == ([2000] * chunks) + ([500] * chunks)
+
+
+def test_yield_limited_chunks_splits_chunk_by_rate(recorded_sleep_calls):
+    middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
+
+    async def collect_parts():
+        parts = []
+        async for part in middleware._yield_limited_chunks(b"x" * 25, 10):
+            parts.append(part)
+        return parts
+
+    parts = asyncio.run(collect_parts())
+
+    assert [len(part) for part in parts] == [10, 10, 5]
+    assert b"".join(parts) == b"x" * 25
+    assert recorded_sleep_calls == pytest.approx([1.0, 1.0, 0.5])
 
 # FastAPIのルート解決テスト
 def test_fastapi_route_resolution():
@@ -170,6 +159,20 @@ def test_fastapi_dynamic_route_resolution():
     mock_request = Request(scope={"type": "http", "app": app, "path": "/items/123", "method": "GET"})
     assert middleware.get_handler_name(mock_request, "/items/123") == "read_item"
 
+
+def test_fastapi_route_resolution_accepts_suffix_based_limit_name():
+    app = FastAPI()
+    app.state.response_bandwidth_limits = {"download": 100}
+
+    @app.get("/download")
+    async def download_response():
+        return {"ok": True}
+
+    middleware = ResponseBandwidthLimiterMiddleware(app)
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/download", "method": "GET"})
+
+    assert middleware.get_handler_name(mock_request, "/download") == "download"
+
 # 非ストリーミングレスポンスのヘッダ保持テスト
 def test_plain_response_headers_are_preserved():
     app = FastAPI()
@@ -189,7 +192,7 @@ def test_plain_response_headers_are_preserved():
     assert response.headers["X-Test"] == "ok"
     assert response.cookies.get("session") == "value"
 
-def test_small_plain_response_is_delayed_before_first_chunk():
+def test_small_plain_response_is_delayed_before_first_chunk(recorded_sleep_calls):
     app = FastAPI()
     app.state.response_bandwidth_limits = {"slow_response": 10}
     app.add_middleware(ResponseBandwidthLimiterMiddleware)
@@ -199,14 +202,11 @@ def test_small_plain_response_is_delayed_before_first_chunk():
         return PlainTextResponse("x" * 20)
 
     client = TestClient(app)
-
-    start_time = time.time()
     response = client.get("/slow")
-    elapsed = time.time() - start_time
 
     assert response.status_code == 200
     assert response.text == "x" * 20
-    assert elapsed >= 1.5, f"小さいレスポンスでも帯域制限前に即時送信されています: {elapsed:.2f}秒"
+    assert recorded_sleep_calls == pytest.approx([1.0, 1.0])
 
 
 def test_policy_rejects_after_threshold_per_ip():
@@ -249,7 +249,53 @@ def test_policy_uses_ip_scope_independently():
     assert client.get("/ip-limited", headers={"X-Forwarded-For": "10.0.0.2"}).status_code == 200
 
 
-def test_policy_applies_delay_before_handler_execution():
+def test_policy_uses_key_func_instead_of_ip_headers():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(key_func=lambda request: request.headers.get("X-Api-Key", "anonymous"))
+    app.state.response_bandwidth_limiter = limiter
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    @app.get("/key-limited")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="key limited"))])
+    async def key_limited(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/key-limited", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
+    assert client.get("/key-limited", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "10.0.0.2"}).status_code == 429
+    assert client.get("/key-limited", headers={"X-Api-Key": "beta", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
+
+
+def test_get_request_key_prefers_real_ip_and_falls_back_to_scope_client():
+    middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
+
+    real_ip_request = Request(scope={
+        "type": "http",
+        "path": "/",
+        "method": "GET",
+        "headers": [(b"x-real-ip", b"192.0.2.10")],
+    })
+    scope_client_request = Request(scope={
+        "type": "http",
+        "path": "/",
+        "method": "GET",
+        "headers": [],
+        "client": ("198.51.100.7", 12345),
+    })
+    unknown_request = Request(scope={
+        "type": "http",
+        "path": "/",
+        "method": "GET",
+        "headers": [],
+    })
+
+    assert middleware._get_request_key(real_ip_request, None) == "192.0.2.10"
+    assert middleware._get_request_key(scope_client_request, None) == "198.51.100.7"
+    assert middleware._get_request_key(unknown_request, None) == "unknown"
+
+
+def test_policy_applies_delay_before_handler_execution(recorded_sleep_calls):
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
     app.state.response_bandwidth_limiter = limiter
@@ -263,16 +309,13 @@ def test_policy_applies_delay_before_handler_execution():
     client = TestClient(app)
 
     assert client.get("/delay").status_code == 200
-
-    start_time = time.time()
     response = client.get("/delay")
-    elapsed = time.time() - start_time
 
     assert response.status_code == 200
-    assert elapsed >= 0.18, f"delay action が適用されていません: {elapsed:.2f}秒"
+    assert recorded_sleep_calls == pytest.approx([0.2])
 
 
-def test_policy_throttle_overrides_response_rate_after_threshold():
+def test_policy_throttle_overrides_response_rate_after_threshold(recorded_limit_calls):
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
     app.state.response_bandwidth_limiter = limiter
@@ -288,16 +331,14 @@ def test_policy_throttle_overrides_response_rate_after_threshold():
     first = client.get("/policy-throttle")
     assert first.status_code == 200
 
-    start_time = time.time()
     second = client.get("/policy-throttle")
-    elapsed = time.time() - start_time
 
     assert second.status_code == 200
     assert second.text == "x" * 20
-    assert elapsed >= 1.5, f"policy throttle が適用されていません: {elapsed:.2f}秒"
+    assert [call["rate"] for call in recorded_limit_calls] == [10]
 
 
-def test_direct_routes_assignment_still_works_with_policy_support():
+def test_direct_routes_assignment_still_works_with_policy_support(recorded_limit_calls):
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
     app.state.response_bandwidth_limiter = limiter
@@ -309,9 +350,7 @@ def test_direct_routes_assignment_still_works_with_policy_support():
 
     limiter.routes["legacy"] = 10
 
-    start_time = time.time()
     response = TestClient(app).get("/legacy")
-    elapsed = time.time() - start_time
 
     assert response.status_code == 200
-    assert elapsed >= 1.5, f"legacy routes 設定が壊れています: {elapsed:.2f}秒"
+    assert [call["rate"] for call in recorded_limit_calls] == [10]

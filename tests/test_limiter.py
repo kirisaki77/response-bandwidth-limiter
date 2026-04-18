@@ -1,9 +1,9 @@
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from starlette.responses import JSONResponse
 from starlette.responses import PlainTextResponse
-from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimitExceeded, Rule, Throttle, _response_bandwidth_limit_exceeded_handler
-import time
+from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimitExceeded, Rule, Throttle, _response_bandwidth_limit_exceeded_handler, get_endpoint_name, get_route_path
 
 # デコレータAPIのテスト
 def test_limiter_decorator():
@@ -98,6 +98,73 @@ def test_rule_and_action_validation():
 
     with pytest.raises(ValueError):
         Delay(seconds=0)
+
+
+def test_rule_and_action_validation_rejects_invalid_types_and_scope():
+    with pytest.raises(TypeError):
+        Throttle(bytes_per_sec="fast")
+
+    with pytest.raises(TypeError):
+        Reject(status_code="429")
+
+    with pytest.raises(ValueError):
+        Reject(status_code=399)
+
+    with pytest.raises(TypeError):
+        Reject(detail=123)
+
+    with pytest.raises(ValueError):
+        Rule(count=1, per="second", action=Reject(), scope="global")
+
+    with pytest.raises(TypeError):
+        Rule(count=1, per="second", action="invalid")
+
+
+def test_rule_window_seconds_supports_all_periods():
+    assert Rule(count=1, per="second", action=Reject()).window_seconds == 1
+    assert Rule(count=1, per="minute", action=Reject()).window_seconds == 60
+    assert Rule(count=1, per="hour", action=Reject()).window_seconds == 3600
+
+
+def test_response_bandwidth_limit_exceeded_exposes_message():
+    exc = ResponseBandwidthLimitExceeded(limit=128, endpoint="download")
+
+    assert exc.limit == 128
+    assert exc.endpoint == "download"
+    assert exc.message == "Endpoint download is limited to 128 bytes/second"
+    assert str(exc) == exc.message
+
+
+@pytest.mark.asyncio
+async def test_response_bandwidth_limit_exceeded_handler_returns_json_response():
+    app = FastAPI()
+    request = Request(scope={"type": "http", "app": app, "path": "/download", "method": "GET", "headers": []})
+    exc = ResponseBandwidthLimitExceeded(limit=256, endpoint="download")
+
+    response = await _response_bandwidth_limit_exceeded_handler(request, exc)
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 429
+    assert response.body == b'{"error":"Bandwidth Limit Exceeded","detail":"Endpoint download is limited to 256 bytes/second"}'
+
+
+def test_util_functions_return_endpoint_and_route_path():
+    scope = {
+        "type": "http",
+        "path": "/items/123",
+        "endpoint": "handler_name",
+        "method": "GET",
+    }
+    request = Request(scope=scope)
+
+    assert get_endpoint_name(request) == "handler_name"
+    assert get_route_path(request) == "/items/123"
+
+
+def test_get_endpoint_name_falls_back_to_path():
+    request = Request(scope={"type": "http", "path": "/fallback", "method": "GET"})
+
+    assert get_endpoint_name(request) == "/fallback"
 
 
 def test_init_app_exposes_policies_and_routes():
