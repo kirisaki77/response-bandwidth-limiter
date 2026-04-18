@@ -15,7 +15,7 @@ classifiers = [
     "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.6"
+requires-python = ">=3.10"
 
 # 必須の依存関係（これがないとライブラリが動作しない）
 dependencies = [
@@ -25,10 +25,11 @@ dependencies = [
 [project.optional-dependencies]
 # 開発用依存関係（テスト、ドキュメント作成など）
 dev = [
-    "pytest>=6.0.0",
-    "httpx>=0.20.0",
-    "fastapi>=0.68.0",
-    "starlette>=0.14.0",
+    "pytest>=9.0.3",
+    "httpx>=0.28.1",
+    "fastapi>=0.136.0",
+    "starlette>=1.0.0",
+    "uvicorn[standard]>=0.44.0",
 ]
 
 [project.urls]
