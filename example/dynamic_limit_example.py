@@ -1,18 +1,16 @@
-from fastapi import FastAPI, Request
 import os
 import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule, Throttle
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+from fastapi import FastAPI, Request
+from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, Rule, Throttle
 from starlette.responses import PlainTextResponse
 
 app = FastAPI()
 
-# リミッターを初期化して登録
 limiter = ResponseBandwidthLimiter()
-app.state.response_bandwidth_limiter = limiter
-
-# ミドルウェアを追加
-app.add_middleware(ResponseBandwidthLimiterMiddleware)
+limiter.init_app(app)
 
 # テスト用データのサイズ
 data_size = 50000  # 50KB
@@ -25,7 +23,7 @@ async def get_data():
 @app.get("/admin/set-limit")
 async def set_limit(endpoint: str, limit: int):
     """帯域制限を動的に変更するエンドポイント"""
-    limiter.routes[endpoint] = limit
+    limiter.update_route(endpoint, limit)
     return {
         "status": "success", 
         "message": f"{endpoint}の帯域制限を{limit} bytes/secに設定しました",
@@ -35,23 +33,11 @@ async def set_limit(endpoint: str, limit: int):
 
 
 def serialize_rule(rule: Rule) -> dict:
-    action = rule.action
-    if isinstance(action, Throttle):
-        action_data = {"type": "throttle", "bytes_per_sec": action.bytes_per_sec}
-    elif isinstance(action, Delay):
-        action_data = {"type": "delay", "seconds": action.seconds}
-    else:
-        action_data = {
-            "type": "reject",
-            "status_code": action.status_code,
-            "detail": action.detail,
-        }
-
     return {
         "count": rule.count,
         "per": rule.per,
         "scope": rule.scope,
-        "action": action_data,
+        "action": rule.action.to_dict(),
     }
 
 
@@ -59,17 +45,17 @@ def serialize_rule(rule: Rule) -> dict:
 async def set_policy(endpoint: str, mode: str = "throttle"):
     """request count policy を動的に変更するエンドポイント"""
     if mode == "throttle":
-        limiter.policies[endpoint] = [
+        limiter.update_policy(endpoint, [
             Rule(count=2, per="second", action=Throttle(bytes_per_sec=256)),
             Rule(count=10, per="minute", action=Reject(detail="Too many requests from the same IP")),
-        ]
+        ])
     elif mode == "delay":
-        limiter.policies[endpoint] = [
+        limiter.update_policy(endpoint, [
             Rule(count=2, per="second", action=Delay(seconds=0.2)),
             Rule(count=10, per="minute", action=Reject(detail="Request burst detected")),
-        ]
+        ])
     elif mode == "clear":
-        limiter.policies.pop(endpoint, None)
+        limiter.remove_policy(endpoint)
     else:
         return {
             "status": "error",
@@ -80,7 +66,7 @@ async def set_policy(endpoint: str, mode: str = "throttle"):
         "status": "success",
         "endpoint": endpoint,
         "mode": mode,
-        "policies": [serialize_rule(rule) for rule in limiter.policies.get(endpoint, [])],
+        "policies": [serialize_rule(rule) for rule in limiter.get_rules(endpoint)],
     }
 
 @app.get("/")
@@ -101,8 +87,7 @@ async def info():
         },
     }
 
-# 初期設定 (10KB/sec)
-limiter.routes["get_data"] = 10000
+limiter.update_route("get_data", 10000)
 
 # アプリケーション実行
 if __name__ == "__main__":

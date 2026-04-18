@@ -73,6 +73,23 @@ def test_limit_rules_registers_policy():
     assert limiter.policies["limited_endpoint"] == rules
 
 
+def test_update_route_and_policy_manage_runtime_configuration():
+    limiter = ResponseBandwidthLimiter()
+    rules = [Rule(count=1, per="second", action=Reject())]
+
+    limiter.update_route("download", 128)
+    limiter.update_policy("download", rules)
+
+    assert limiter.get_limit("download") == 128
+    assert limiter.get_rules("download") == rules
+
+    limiter.remove_route("download")
+    limiter.remove_policy("download")
+
+    assert limiter.get_limit("download") is None
+    assert limiter.get_rules("download") == []
+
+
 def test_invalid_limit_rules_argument():
     limiter = ResponseBandwidthLimiter()
 
@@ -126,6 +143,12 @@ def test_rule_window_seconds_supports_all_periods():
     assert Rule(count=1, per="hour", action=Reject()).window_seconds == 3600
 
 
+def test_action_priority_values_are_stable():
+    assert Reject().priority == 0
+    assert Delay(seconds=0.1).priority == 1
+    assert Throttle(bytes_per_sec=1).priority == 2
+
+
 def test_response_bandwidth_limit_exceeded_exposes_message():
     exc = ResponseBandwidthLimitExceeded(limit=128, endpoint="download")
 
@@ -170,10 +193,11 @@ def test_get_endpoint_name_falls_back_to_path():
 def test_init_app_exposes_policies_and_routes():
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
-    limiter.routes["download"] = 128
-    limiter.policies["download"] = [Rule(count=1, per="second", action=Reject())]
+    limiter.update_route("download", 128)
+    limiter.update_policy("download", [Rule(count=1, per="second", action=Reject())])
 
     limiter.init_app(app)
 
-    assert app.state.response_bandwidth_limits["download"] == 128
-    assert app.state.response_bandwidth_policies["download"][0].count == 1
+    assert app.state.response_bandwidth_limiter is limiter
+    assert limiter.get_limit("download") == 128
+    assert limiter.get_rules("download")[0].count == 1
