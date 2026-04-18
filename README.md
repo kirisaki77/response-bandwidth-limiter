@@ -222,6 +222,8 @@ async def set_limit(endpoint: str, limit: int):
     return {"status": "success", "endpoint": endpoint, "limit": limit}
 ```
 
+The `/admin` endpoint above is intentionally a minimal example and does not include authentication or authorization. Do not expose this pattern as-is in production. Protect runtime configuration endpoints with your application's normal access controls.
+
 **Important Note**: Bandwidth limit changes are persistent. Once you change an endpoint's bandwidth limit, that change will be maintained until the server restarts and applies to all subsequent requests. It's not a temporary change but a configuration update.
 
 For example, if you change a limit from 1000 bytes/sec to 2000 bytes/sec, all subsequent requests will be processed with the 2000 bytes/sec limit. To revert to the original speed, you need to explicitly reset it.
@@ -252,6 +254,8 @@ async def set_policy(endpoint: str, mode: str):
 
 As with `limiter.routes`, policy changes remain active until you replace or remove them.
 
+As with the dynamic limit example, `/admin/set-policy` is only a sample management endpoint. Add authentication and authorization before using a similar endpoint outside local development or internal tooling.
+
 ### Bandwidth Limits for Specific Users or IPs
 
 ```python
@@ -274,6 +278,7 @@ async def download_for_user(request: Request, user_id: str):
 - Bandwidth limits are applied server-side, so actual transfer speeds may vary depending on client-side bandwidth and network conditions.
 - Be mindful of memory usage when transferring large files.
 - In distributed systems, limits are applied per server.
+- If request identity is determined from `X-Forwarded-For`, only trust that header when the application is behind a trusted reverse proxy that overwrites or sanitizes it. Otherwise, clients can spoof the header and bypass per-IP policies.
 
 ## API Reference
 
