@@ -2,7 +2,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse, StreamingResponse
-from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
+from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule, Throttle
 import time
 import asyncio
 
@@ -207,3 +207,111 @@ def test_small_plain_response_is_delayed_before_first_chunk():
     assert response.status_code == 200
     assert response.text == "x" * 20
     assert elapsed >= 1.5, f"小さいレスポンスでも帯域制限前に即時送信されています: {elapsed:.2f}秒"
+
+
+def test_policy_rejects_after_threshold_per_ip():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    app.state.response_bandwidth_limiter = limiter
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    @app.get("/limited")
+    @limiter.limit_rules([Rule(count=2, per="second", action=Reject(detail="too many requests"))])
+    async def limited(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/limited").status_code == 200
+    assert client.get("/limited").status_code == 200
+
+    rejected = client.get("/limited")
+    assert rejected.status_code == 429
+    assert rejected.json()["detail"] == "too many requests"
+    assert rejected.headers["Retry-After"] == "1"
+
+
+def test_policy_uses_ip_scope_independently():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    app.state.response_bandwidth_limiter = limiter
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    @app.get("/ip-limited")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject())])
+    async def ip_limited(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/ip-limited", headers={"X-Forwarded-For": "10.0.0.1"}).status_code == 200
+    assert client.get("/ip-limited", headers={"X-Forwarded-For": "10.0.0.1"}).status_code == 429
+    assert client.get("/ip-limited", headers={"X-Forwarded-For": "10.0.0.2"}).status_code == 200
+
+
+def test_policy_applies_delay_before_handler_execution():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    app.state.response_bandwidth_limiter = limiter
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    @app.get("/delay")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Delay(seconds=0.2))])
+    async def delayed(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/delay").status_code == 200
+
+    start_time = time.time()
+    response = client.get("/delay")
+    elapsed = time.time() - start_time
+
+    assert response.status_code == 200
+    assert elapsed >= 0.18, f"delay action が適用されていません: {elapsed:.2f}秒"
+
+
+def test_policy_throttle_overrides_response_rate_after_threshold():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    app.state.response_bandwidth_limiter = limiter
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    @app.get("/policy-throttle")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Throttle(bytes_per_sec=10))])
+    async def policy_throttle(request: Request):
+        return PlainTextResponse("x" * 20)
+
+    client = TestClient(app)
+
+    first = client.get("/policy-throttle")
+    assert first.status_code == 200
+
+    start_time = time.time()
+    second = client.get("/policy-throttle")
+    elapsed = time.time() - start_time
+
+    assert second.status_code == 200
+    assert second.text == "x" * 20
+    assert elapsed >= 1.5, f"policy throttle が適用されていません: {elapsed:.2f}秒"
+
+
+def test_direct_routes_assignment_still_works_with_policy_support():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    app.state.response_bandwidth_limiter = limiter
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    @app.get("/legacy")
+    async def legacy():
+        return PlainTextResponse("x" * 20)
+
+    limiter.routes["legacy"] = 10
+
+    start_time = time.time()
+    response = TestClient(app).get("/legacy")
+    elapsed = time.time() - start_time
+
+    assert response.status_code == 200
+    assert elapsed >= 1.5, f"legacy routes 設定が壊れています: {elapsed:.2f}秒"

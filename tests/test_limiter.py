@@ -2,7 +2,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse
-from response_bandwidth_limiter import ResponseBandwidthLimiter, ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler
+from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimitExceeded, Rule, Throttle, _response_bandwidth_limit_exceeded_handler
 import time
 
 # デコレータAPIのテスト
@@ -60,3 +60,53 @@ def test_invalid_limit_argument():
     # ルート名が正しく保存されているか
     assert "valid_test" in limiter.routes
     assert limiter.routes["valid_test"] == 1000
+
+
+def test_limit_rules_registers_policy():
+    limiter = ResponseBandwidthLimiter()
+    rules = [Rule(count=2, per="second", action=Reject())]
+
+    @limiter.limit_rules(rules)
+    async def limited_endpoint(request: Request):
+        return PlainTextResponse("ok")
+
+    assert limiter.policies["limited_endpoint"] == rules
+
+
+def test_invalid_limit_rules_argument():
+    limiter = ResponseBandwidthLimiter()
+
+    with pytest.raises(TypeError):
+        limiter.limit_rules("not_a_list")
+
+    with pytest.raises(ValueError):
+        limiter.limit_rules([])
+
+    with pytest.raises(TypeError):
+        limiter.limit_rules(["not_a_rule"])
+
+
+def test_rule_and_action_validation():
+    with pytest.raises(ValueError):
+        Rule(count=0, per="second", action=Reject())
+
+    with pytest.raises(ValueError):
+        Rule(count=1, per="day", action=Reject())
+
+    with pytest.raises(ValueError):
+        Throttle(bytes_per_sec=0)
+
+    with pytest.raises(ValueError):
+        Delay(seconds=0)
+
+
+def test_init_app_exposes_policies_and_routes():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.routes["download"] = 128
+    limiter.policies["download"] = [Rule(count=1, per="second", action=Reject())]
+
+    limiter.init_app(app)
+
+    assert app.state.response_bandwidth_limits["download"] == 128
+    assert app.state.response_bandwidth_policies["download"][0].count == 1

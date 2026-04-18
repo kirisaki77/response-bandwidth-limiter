@@ -2,7 +2,7 @@
 
 *Read this in other languages: [English](README.md), [日本語](README.ja.md)*
 
-A response bandwidth limiting middleware for FastAPI and Starlette. It allows you to limit the response sending speed for specific endpoints.
+A response bandwidth limiting middleware for FastAPI and Starlette. It allows you to limit response sending speed for specific endpoints and apply request-count based policies per IP.
 
 ## Installation
 
@@ -57,6 +57,43 @@ async def download_file(request: Request):
 async def stream_video(request: Request):
     return FileResponse("path/to/video.mp4")
 ```
+
+### Request-Count Policies with `limit_rules`
+
+You can also apply step-based policies by IP. Each rule watches the request count within a time window and triggers one action.
+
+```python
+from fastapi import FastAPI, Request
+from starlette.responses import PlainTextResponse
+from response_bandwidth_limiter import (
+    Delay,
+    Reject,
+    ResponseBandwidthLimiter,
+    ResponseBandwidthLimiterMiddleware,
+    Rule,
+    Throttle,
+)
+
+app = FastAPI()
+limiter = ResponseBandwidthLimiter()
+app.state.response_bandwidth_limiter = limiter
+app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+@app.get("/download")
+@limiter.limit_rules([
+    Rule(count=10, per="second", action=Throttle(bytes_per_sec=512)),
+    Rule(count=30, per="minute", action=Delay(seconds=0.5)),
+    Rule(count=200, per="hour", action=Reject(detail="Too many downloads from the same IP")),
+])
+async def download_file(request: Request):
+    return PlainTextResponse("payload" * 4096)
+```
+
+Available actions:
+
+1. `Throttle(bytes_per_sec=...)`: slows the response stream.
+2. `Delay(seconds=...)`: waits before the endpoint handler runs.
+3. `Reject(status_code=429, detail=...)`: returns an error response.
 
 ### Usage with Starlette
 
@@ -189,6 +226,32 @@ async def set_limit(endpoint: str, limit: int):
 
 For example, if you change a limit from 1000 bytes/sec to 2000 bytes/sec, all subsequent requests will be processed with the 2000 bytes/sec limit. To revert to the original speed, you need to explicitly reset it.
 
+### Dynamic Policy Updates
+
+You can update request-count policies at runtime through `limiter.policies`.
+
+```python
+from response_bandwidth_limiter import Delay, Reject, Rule, Throttle
+
+@app.get("/admin/set-policy")
+async def set_policy(endpoint: str, mode: str):
+    if mode == "throttle":
+        limiter.policies[endpoint] = [
+            Rule(count=5, per="second", action=Throttle(bytes_per_sec=256)),
+            Rule(count=20, per="minute", action=Reject(detail="Too many requests")),
+        ]
+    elif mode == "delay":
+        limiter.policies[endpoint] = [
+            Rule(count=3, per="second", action=Delay(seconds=0.25)),
+        ]
+    else:
+        limiter.policies.pop(endpoint, None)
+
+    return {"status": "success", "endpoint": endpoint, "policies": endpoint in limiter.policies}
+```
+
+As with `limiter.routes`, policy changes remain active until you replace or remove them.
+
 ### Bandwidth Limits for Specific Users or IPs
 
 ```python
@@ -243,6 +306,17 @@ class ResponseBandwidthLimiter:
         Exceptions:
             TypeError: If rate is not an integer
         """
+
+    def limit_rules(self, rules):
+        """
+        Returns a decorator that applies request-count based rules to endpoints
+
+        Arguments:
+            rules: List of Rule objects evaluated per request
+
+        Returns:
+            Decorator function
+        """
         
     def init_app(self, app):
         """
@@ -252,6 +326,19 @@ class ResponseBandwidthLimiter:
             app: FastAPI or Starlette application instance
         """
 ```
+
+### Rule, Throttle, Delay, Reject
+
+```python
+Rule(count: int, per: str, action, scope: str = "ip")
+Throttle(bytes_per_sec: int)
+Delay(seconds: float)
+Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
+```
+
+- `per` supports `second`, `minute`, and `hour`.
+- `scope` currently supports `ip`.
+- Rules are evaluated per endpoint and per client IP.
 
 ### ResponseBandwidthLimiterMiddleware
 
