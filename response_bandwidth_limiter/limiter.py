@@ -48,6 +48,8 @@ class ResponseBandwidthLimiter:
         """
         if not isinstance(rate, int):
             raise TypeError("帯域制限値は整数である必要があります。例: @limiter.limit(1024)")
+        if rate <= 0:
+            raise ValueError("帯域制限値は1以上である必要があります。無効化する場合は設定を削除してください。")
             
         def decorator(func):
             # 関数名を保存

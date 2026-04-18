@@ -43,6 +43,19 @@ def test_multiple_decorated_functions():
     assert "function2" in endpoint_bandwidth_limits
     assert endpoint_bandwidth_limits["function2"] == 200
 
+def test_decorator_rejects_non_positive_limit():
+    endpoint_bandwidth_limits.clear()
+
+    with pytest.raises(ValueError):
+        @set_response_bandwidth_limit(0)
+        async def zero_limit(request):
+            return PlainTextResponse("test")
+
+    with pytest.raises(ValueError):
+        @set_response_bandwidth_limit(-100)
+        async def negative_limit(request):
+            return PlainTextResponse("test")
+
 # FastAPIとの統合テスト
 def test_fastapi_decorator_integration():
     # テスト前に既存の値をクリア

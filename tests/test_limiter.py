@@ -41,6 +41,16 @@ def test_invalid_limit_argument():
         @limiter.limit("not_a_number")
         async def invalid_test(request: Request):
             pass
+
+    with pytest.raises(ValueError):
+        @limiter.limit(0)
+        async def zero_limit_test(request: Request):
+            pass
+
+    with pytest.raises(ValueError):
+        @limiter.limit(-1)
+        async def negative_limit_test(request: Request):
+            pass
     
     # 正しく動作する整数の場合
     @limiter.limit(1000)
