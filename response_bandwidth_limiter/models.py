@@ -15,6 +15,13 @@ class Throttle:
         if self.bytes_per_sec <= 0:
             raise ValueError("bytes_per_sec は1以上である必要があります。")
 
+    @property
+    def priority(self) -> int:
+        return 2
+
+    def to_dict(self) -> dict:
+        return {"type": "throttle", "bytes_per_sec": self.bytes_per_sec}
+
 
 @dataclass(frozen=True)
 class Reject:
@@ -29,6 +36,13 @@ class Reject:
         if not isinstance(self.detail, str):
             raise TypeError("detail は文字列である必要があります。")
 
+    @property
+    def priority(self) -> int:
+        return 0
+
+    def to_dict(self) -> dict:
+        return {"type": "reject", "status_code": self.status_code, "detail": self.detail}
+
 
 @dataclass(frozen=True)
 class Delay:
@@ -39,6 +53,13 @@ class Delay:
             raise TypeError("seconds は数値である必要があります。")
         if self.seconds <= 0:
             raise ValueError("seconds は0より大きい必要があります。")
+
+    @property
+    def priority(self) -> int:
+        return 1
+
+    def to_dict(self) -> dict:
+        return {"type": "delay", "seconds": self.seconds}
 
 
 Action = Union[Throttle, Reject, Delay]

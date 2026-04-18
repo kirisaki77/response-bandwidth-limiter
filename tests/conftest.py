@@ -1,15 +1,7 @@
 import pytest
 
 import response_bandwidth_limiter.middleware as middleware_module
-from response_bandwidth_limiter.decorator import endpoint_bandwidth_limits
 from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
-
-
-@pytest.fixture(autouse=True)
-def clear_endpoint_bandwidth_limits():
-    endpoint_bandwidth_limits.clear()
-    yield
-    endpoint_bandwidth_limits.clear()
 
 
 @pytest.fixture
