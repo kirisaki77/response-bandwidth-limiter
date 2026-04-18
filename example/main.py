@@ -27,6 +27,7 @@ async def slow_response():
 
 
 @app.get("/policy")
+# Matching rules are evaluated independently; only one action is applied.
 @limiter.limit_rules([
     Rule(count=2, per="second", action=Throttle(bytes_per_sec=1024)),
     Rule(count=5, per=timedelta(minutes=1), action=Delay(seconds=0.25)),
@@ -35,9 +36,9 @@ async def slow_response():
 async def policy_response(request: Request):
     return PlainTextResponse(
         "Policy endpoint demo\n"
-        "Over 2 requests/second -> throttle to 1024 bytes/sec\n"
-        "Over 5 requests/minute -> delay 0.25 seconds\n"
-        "Over 10 requests/30 minutes -> reject with 429\n"
+        "Matching rules are evaluated independently; they are not applied top-to-bottom.\n"
+        "Only the highest-priority action is used: Reject > Delay > Throttle.\n"
+        "Current rules: over 10 requests/30 minutes -> reject with 429, over 5 requests/minute -> delay 0.25 seconds, over 2 requests/second -> throttle to 1024 bytes/sec.\n"
         + ("policy-demo-" * 1024)
     )
 
@@ -63,6 +64,6 @@ if __name__ == "__main__":
     print("以下のURLで動作確認できます:")
     print("  - http://127.0.0.1:8000/fast (@limiter.limit 2048 bytes/sec)")
     print("  - http://127.0.0.1:8000/slow (@limiter.limit 128 bytes/sec)")
-    print("  - http://127.0.0.1:8000/policy (IPごとの段階的policyのデモ)")
+    print("  - http://127.0.0.1:8000/policy (複数ruleから1つのactionを選ぶデモ)")
     print("ブラウザのDevTools Consoleで/slowと/fastの通信時間を比較できます")
     uvicorn.run(app, host="127.0.0.1", port=8000)

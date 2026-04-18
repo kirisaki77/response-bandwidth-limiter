@@ -79,7 +79,9 @@ async def download_file(request: Request):
 limiter.init_app(app)
 ```
 
-If multiple rules match the same request, the middleware applies only one action. Selection uses action priority first, then `sort_key`, and finally the rule order in the `limit_rules([...])` list.
+If multiple rules match the same request, the middleware evaluates those rules independently and applies only one action. The rules are not executed top-to-bottom. Selection uses action priority first, then `sort_key`, and finally the rule order in the `limit_rules([...])` list as a tiebreaker.
+
+For example, if a request matches both a `Throttle` rule and a `Delay` rule, only `Delay` is applied even when the `Throttle` rule appears earlier in the list.
 
 Available actions, ordered by selection priority when multiple rules match:
 
@@ -206,10 +208,10 @@ Throttle(bytes_per_sec: int)
 - `timedelta` values must be whole-second durations.
 - `scope` currently supports only `ip`.
 - Action instances expose `priority`, `sort_key`, and `to_dict()`.
-- If multiple rules match the same request, the middleware selects a single action with the lowest `priority` value.
+- If multiple rules match the same request, the middleware evaluates those rules independently and selects a single action with the lowest `priority` value.
 - The built-in priority order is `Reject` (0), `Delay` (1), then `Throttle` (2).
 - If priorities are equal, the action with the lower `sort_key` wins. For the built-in actions, that means longer `Delay` values win over shorter ones, and lower `Throttle(bytes_per_sec=...)` values win over higher ones.
-- If both `priority` and `sort_key` are equal, the rule defined earlier in the `limit_rules([...])` list is selected.
+- The rule order in `limit_rules([...])` is only a tiebreaker. If both `priority` and `sort_key` are equal, the rule defined earlier in the list is selected.
 
 Custom policy actions can implement `ActionProtocol` and return a `PolicyDecision` from `decide()`. Choose `priority` and `sort_key` values carefully, because the middleware uses them to resolve conflicts between multiple matched rules.
 

@@ -79,7 +79,9 @@ async def download_file(request: Request):
 limiter.init_app(app)
 ```
 
-複数の rule が同じリクエストに一致した場合、middleware は action をすべて順番に適用せず、1つだけ選んで適用します。選択には action の priority を最優先で使い、その後に `sort_key`、最後に `limit_rules([...])` 内での定義順を使います。
+複数の rule が同じリクエストに一致した場合、middleware はそれらを独立して評価し、action は1つだけ選んで適用します。rule は上から順に実行されるわけではありません。選択には action の priority を最優先で使い、その後に `sort_key`、最後に `limit_rules([...])` 内での定義順をタイブレークとして使います。
+
+たとえば、あるリクエストが `Throttle` と `Delay` の両方に一致した場合、`Throttle` の rule が先に書かれていても、実際に適用されるのは `Delay` だけです。
 
 利用できる action。複数一致時の選択優先順で並べています:
 
@@ -206,10 +208,10 @@ Throttle(bytes_per_sec: int)
 - `timedelta` は1秒単位の値だけ受け付けます。
 - `scope` は現状 `ip` のみです。
 - Action には `priority`、`sort_key`、`to_dict()` があります。
-- 複数の rule が同じリクエストに一致した場合、middleware は `priority` が最も小さい action を 1 つだけ選びます。
+- 複数の rule が同じリクエストに一致した場合、middleware はそれらを独立して評価し、`priority` が最も小さい action を 1 つだけ選びます。
 - 組み込み action の優先順は `Reject` (0)、`Delay` (1)、`Throttle` (2) です。
 - `priority` が同じ場合は `sort_key` が小さいほうを選びます。組み込み action では、`Delay` は待機時間が長いほう、`Throttle(bytes_per_sec=...)` は bytes-per-second が低いほうが優先されます。
-- `priority` と `sort_key` も同じ場合は、`limit_rules([...])` 内で先に定義された rule を選びます。
+- `limit_rules([...])` の定義順はタイブレーク専用です。`priority` と `sort_key` も同じ場合だけ、先に定義された rule を選びます。
 
 独自 action を追加する場合は `ActionProtocol` を実装し、`decide()` から `PolicyDecision` を返してください。`priority` と `sort_key` は複数一致時の競合解決に使われるため、値の設計もあわせて行ってください。
 
