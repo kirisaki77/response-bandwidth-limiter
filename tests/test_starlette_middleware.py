@@ -3,7 +3,7 @@ from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse, StreamingResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
-from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
+from response_bandwidth_limiter import Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule
 from starlette.requests import Request
 import time
 
@@ -216,3 +216,26 @@ def test_starlette_small_plain_response_is_delayed_before_first_chunk():
     assert response.status_code == 200
     assert response.text == "x" * 20
     assert elapsed >= 1.5, f"小さいレスポンスでも帯域制限前に即時送信されています: {elapsed:.2f}秒"
+
+
+def test_starlette_policy_rejects_per_ip():
+    limiter = ResponseBandwidthLimiter()
+
+    async def limited(request):
+        return PlainTextResponse("ok")
+
+    limited = limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="starlette limited"))])(limited)
+
+    app = Starlette(routes=[Route("/limited", endpoint=limited)])
+    app.state.response_bandwidth_limiter = limiter
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    client = TestClient(app)
+
+    assert client.get("/limited", headers={"X-Forwarded-For": "10.0.0.10"}).status_code == 200
+
+    rejected = client.get("/limited", headers={"X-Forwarded-For": "10.0.0.10"})
+    assert rejected.status_code == 429
+    assert rejected.json()["detail"] == "starlette limited"
+
+    assert client.get("/limited", headers={"X-Forwarded-For": "10.0.0.11"}).status_code == 200

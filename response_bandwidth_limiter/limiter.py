@@ -1,9 +1,10 @@
 import functools
-from typing import Dict, Any, Callable, Optional, Union
+from typing import Dict, Callable, List, Union
 from fastapi import Request, FastAPI
 from starlette.applications import Starlette
 from .errors import ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler
 from .middleware import ResponseBandwidthLimiterMiddleware
+from .models import Rule
 
 class ResponseBandwidthLimiter:
     """
@@ -28,6 +29,7 @@ class ResponseBandwidthLimiter:
     """
     def __init__(self, key_func: Callable = None):
         self.routes: Dict[str, int] = {}
+        self.policies: Dict[str, List[Rule]] = {}
         self.key_func = key_func  # slowapi互換のため、キー関数を受け入れる
         
     def limit(self, rate: int) -> Callable:
@@ -66,6 +68,36 @@ class ResponseBandwidthLimiter:
             return wrapper
             
         return decorator
+
+    def limit_rules(self, rules: List[Rule]) -> Callable:
+        """
+        request count ベースのポリシーを設定する装飾子
+
+        Args:
+            rules: Rule の配列
+
+        Returns:
+            装飾子関数
+        """
+        if not isinstance(rules, list):
+            raise TypeError("rules は Rule の配列である必要があります。")
+        if not rules:
+            raise ValueError("rules は1件以上指定する必要があります。")
+        if not all(isinstance(rule, Rule) for rule in rules):
+            raise TypeError("rules には Rule のみ指定できます。")
+
+        def decorator(func):
+            endpoint_name = func.__name__
+            self.policies[endpoint_name] = list(rules)
+
+            @functools.wraps(func)
+            async def wrapper(request: Request, *args, **kwargs):
+                return await func(request, *args, **kwargs)
+
+            wrapper.endpoint_name = endpoint_name
+            return wrapper
+
+        return decorator
         
     def init_app(self, app: Union[FastAPI, Starlette]) -> None:
         """
@@ -75,5 +107,7 @@ class ResponseBandwidthLimiter:
             app: FastAPIまたはStarletteアプリケーション
         """
         app.state.response_bandwidth_limits = self.routes
+        app.state.response_bandwidth_policies = self.policies
+        app.state.response_bandwidth_limiter = self
         app.add_middleware(ResponseBandwidthLimiterMiddleware)
         app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler)

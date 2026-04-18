@@ -2,7 +2,7 @@
 
 *他の言語で読む: [English](README.md), [日本語](README.ja.md)*
 
-FastAPIとStarlette用のレスポンス帯域制限ミドルウェア。特定のエンドポイントのレスポンス送信速度を制限することができます。
+FastAPIとStarlette用のレスポンス帯域制限ミドルウェアです。特定のエンドポイントのレスポンス送信速度を制限でき、さらに IP ごとの request count に応じた段階的な policy も適用できます。
 
 ## インストール
 
@@ -57,6 +57,43 @@ async def download_file(request: Request):
 async def stream_video(request: Request):
     return FileResponse("path/to/video.mp4")
 ```
+
+### `limit_rules` による request count policy
+
+IP ごとの request count に応じて、段階的に throttle、delay、reject を適用できます。各 rule は一定時間内の回数を監視し、条件を超えたときに 1 つの action を発動します。
+
+```python
+from fastapi import FastAPI, Request
+from starlette.responses import PlainTextResponse
+from response_bandwidth_limiter import (
+    Delay,
+    Reject,
+    ResponseBandwidthLimiter,
+    ResponseBandwidthLimiterMiddleware,
+    Rule,
+    Throttle,
+)
+
+app = FastAPI()
+limiter = ResponseBandwidthLimiter()
+app.state.response_bandwidth_limiter = limiter
+app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+@app.get("/download")
+@limiter.limit_rules([
+    Rule(count=10, per="second", action=Throttle(bytes_per_sec=512)),
+    Rule(count=30, per="minute", action=Delay(seconds=0.5)),
+    Rule(count=200, per="hour", action=Reject(detail="同一IPからのリクエストが多すぎます")),
+])
+async def download_file(request: Request):
+    return PlainTextResponse("payload" * 4096)
+```
+
+利用できる action:
+
+1. `Throttle(bytes_per_sec=...)`: レスポンスストリームを低速化します。
+2. `Delay(seconds=...)`: エンドポイント実行前に待機します。
+3. `Reject(status_code=429, detail=...)`: エラー応答を返します。
 
 ### Starletteでの使用例
 
@@ -189,6 +226,32 @@ async def set_limit(endpoint: str, limit: int):
 
 例えば、あるエンドポイントの制限を1000 bytes/secから2000 bytes/secに変更した場合、それ以降のすべてのリクエストは2000 bytes/secの制限で処理されます。元の速度に戻す場合は、明示的に再設定する必要があります。
 
+### 動的な policy 更新
+
+`limiter.policies` を更新することで、request count policy も実行時に差し替えできます。
+
+```python
+from response_bandwidth_limiter import Delay, Reject, Rule, Throttle
+
+@app.get("/admin/set-policy")
+async def set_policy(endpoint: str, mode: str):
+    if mode == "throttle":
+        limiter.policies[endpoint] = [
+            Rule(count=5, per="second", action=Throttle(bytes_per_sec=256)),
+            Rule(count=20, per="minute", action=Reject(detail="リクエストが多すぎます")),
+        ]
+    elif mode == "delay":
+        limiter.policies[endpoint] = [
+            Rule(count=3, per="second", action=Delay(seconds=0.25)),
+        ]
+    else:
+        limiter.policies.pop(endpoint, None)
+
+    return {"status": "success", "endpoint": endpoint, "policies": endpoint in limiter.policies}
+```
+
+`limiter.routes` と同様に、policy の変更も次回以降のリクエストに継続して適用されます。
+
 ### 特定のユーザーやIPに対する帯域制限
 
 ```python
@@ -243,6 +306,17 @@ class ResponseBandwidthLimiter:
         例外:
             TypeError: rateが整数でない場合
         """
+
+    def limit_rules(self, rules):
+        """
+        request count ベースの rule をエンドポイントに適用するデコレータを返します
+
+        引数:
+            rules: リクエストごとに評価される Rule の配列
+
+        戻り値:
+            デコレータ関数
+        """
         
     def init_app(self, app):
         """
@@ -252,6 +326,19 @@ class ResponseBandwidthLimiter:
             app: FastAPIまたはStarletteアプリケーションインスタンス
         """
 ```
+
+### Rule, Throttle, Delay, Reject
+
+```python
+Rule(count: int, per: str, action, scope: str = "ip")
+Throttle(bytes_per_sec: int)
+Delay(seconds: float)
+Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
+```
+
+- `per` は `second`、`minute`、`hour` をサポートします。
+- `scope` は現状 `ip` のみサポートします。
+- rule は endpoint ごと、かつ client IP ごとに評価されます。
 
 ### ResponseBandwidthLimiterMiddleware
 
