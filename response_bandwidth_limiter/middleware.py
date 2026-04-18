@@ -1,33 +1,36 @@
-from fastapi import Request
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse, StreamingResponse
-from starlette.routing import Match
 import asyncio
-from typing import Any, AsyncIterator, List, Optional
+from ipaddress import ip_address
+from typing import Any, AsyncIterator, Callable, Optional
 
-from .models import Delay, Reject, Rule, Throttle
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Match
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from .models import PolicyDecision, Rule
 from .policy import MatchedPolicy, PolicyEvaluator
 from .streaming import ResponseStreamer
 
-class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
+class ResponseBandwidthLimiterMiddleware:
     chunk_size = 8192
 
-    def __init__(self, app: Any):
+    def __init__(
+        self,
+        app: ASGIApp,
+        policy_evaluator: Optional[PolicyEvaluator] = None,
+        response_streamer: Optional[ResponseStreamer] = None,
+    ):
         """
         帯域制限ミドルウェア
         
         Args:
             app: FastAPIまたはStarletteアプリ
         """
-        super().__init__(app)
-        self.policy_evaluator = PolicyEvaluator()
-        self.response_streamer = ResponseStreamer(chunk_size=self.chunk_size, sleep_func=asyncio.sleep)
-        
-    def get_routes(self) -> List[Any]:
-        """アプリケーションからルート情報を取得"""
-        return getattr(self.app, "routes", [])
+        self.app = app
+        self.policy_evaluator = policy_evaluator or PolicyEvaluator()
+        self.response_streamer = response_streamer or ResponseStreamer(chunk_size=self.chunk_size, sleep_func=asyncio.sleep)
 
-    def _get_limit_name(self, route: Any, endpoint: Any, path: str, configured_names: Any) -> Optional[str]:
+    def _get_limit_name(self, route: Any, endpoint: Any, path: str, configured_names: set[str]) -> Optional[str]:
         endpoint_name = getattr(endpoint, "__name__", None)
         if endpoint_name in configured_names:
             return endpoint_name
@@ -49,7 +52,7 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
 
         return None
 
-    def _find_handler_name(self, routes: List[Any], scope: Dict[str, Any], path: str, configured_names: Any) -> Optional[str]:
+    def _find_handler_name(self, routes: list[Any], scope: Scope, path: str, configured_names: set[str]) -> Optional[str]:
         for route in routes:
             if not hasattr(route, "matches"):
                 continue
@@ -77,20 +80,39 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
         async for part in self.response_streamer.yield_limited_chunks(chunk, max_rate):
             yield part
 
-    def _build_streaming_response(self, response: Any, iterator: Any) -> StreamingResponse:
-        return self.response_streamer.build_streaming_response(response, iterator)
+    def _extract_valid_ip(self, raw_value: Optional[str]) -> Optional[str]:
+        if raw_value is None:
+            return None
 
-    def _get_request_key(self, request: Request, key_func: Any) -> str:
+        for candidate in raw_value.split(","):
+            normalized = candidate.strip()
+            if not normalized:
+                continue
+            try:
+                ip_address(normalized)
+            except ValueError:
+                continue
+            return normalized
+
+        return None
+
+    def _get_request_key(
+        self,
+        request: Request,
+        key_func: Optional[Callable[[Request], Any]],
+        trust_proxy_headers: bool = False,
+    ) -> str:
         if callable(key_func):
             return str(key_func(request))
 
-        forwarded_for = request.headers.get("x-forwarded-for")
-        if forwarded_for:
-            return forwarded_for.split(",")[0].strip()
+        if trust_proxy_headers:
+            forwarded_ip = self._extract_valid_ip(request.headers.get("x-forwarded-for"))
+            if forwarded_ip is not None:
+                return forwarded_ip
 
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip.strip()
+            real_ip = self._extract_valid_ip(request.headers.get("x-real-ip"))
+            if real_ip is not None:
+                return real_ip
 
         client = getattr(request, "client", None)
         if client and getattr(client, "host", None):
@@ -108,22 +130,36 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
             return None
         return getattr(app_state, "response_bandwidth_limiter", None)
 
-    def _evaluate_policy_rules(self, request: Request, handler_name: str, rules: List[Rule], key_func: Any) -> Optional[MatchedPolicy]:
-        request_key = self._get_request_key(request, key_func)
+    def _evaluate_policy_rules(
+        self,
+        request: Request,
+        handler_name: str,
+        rules: list[Rule],
+        key_func: Any,
+        trust_proxy_headers: bool,
+    ) -> Optional[MatchedPolicy]:
+        request_key = self._get_request_key(request, key_func, trust_proxy_headers)
         return self.policy_evaluator.evaluate(request_key, handler_name, rules)
 
-    def _build_reject_response(self, rule: Rule, retry_after: int) -> JSONResponse:
-        action = rule.action
-        headers = {"Retry-After": str(retry_after)}
+    def _build_reject_response(self, decision: PolicyDecision) -> JSONResponse:
+        headers = {"Retry-After": str(decision.retry_after)}
         return JSONResponse(
-            status_code=action.status_code,
+            status_code=decision.reject_status,
             headers=headers,
             content={
                 "error": "Rate Limit Exceeded",
-                "detail": action.detail,
+                "detail": decision.reject_detail,
             },
         )
-        
+
+    def _collect_active_rules(self, limiter: Any) -> dict[str, list[Rule]]:
+        active_rules: dict[str, list[Rule]] = {}
+        for name in limiter.configured_names:
+            rules = limiter.get_rules(name)
+            if rules:
+                active_rules[name] = rules
+        return active_rules
+
     def get_handler_name(self, request: Request, path: str) -> Optional[str]:
         """
         パスに一致するハンドラー名を取得
@@ -147,52 +183,78 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
         routes = getattr(app, "routes", [])
         return self._find_handler_name(routes, request.scope, path, configured_names)
 
-    async def dispatch(self, request: Request, call_next):
-        """リクエストに対して帯域制限を適用"""
-        # リクエストからアプリを取得
-        app = request.scope.get("app", self.app)
+    async def _send_limited_body(self, send: Send, body: bytes, more_body: bool, max_rate: int) -> None:
+        pending_chunk: Optional[bytes] = None
+        async for limited_chunk in self._yield_limited_chunks(body, max_rate):
+            if pending_chunk is not None:
+                await send({"type": "http.response.body", "body": pending_chunk, "more_body": True})
+            pending_chunk = limited_chunk
+
+        if pending_chunk is None:
+            await send({"type": "http.response.body", "body": body, "more_body": more_body})
+            return
+
+        await send({"type": "http.response.body", "body": pending_chunk, "more_body": more_body})
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        app = scope.get("app", self.app)
         limiter = self._get_limiter(app)
         if limiter is None:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
-        path = request.scope["path"]
+        path = scope["path"]
         handler_name = self.get_handler_name(request, path)
 
         if handler_name is None:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
-        rules = limiter.get_rules(handler_name)
-        self.policy_evaluator.cleanup_expired({name: limiter.get_rules(name) for name in limiter.configured_names if limiter.get_rules(name)})
-        matched_rule = self._evaluate_policy_rules(request, handler_name, rules, limiter.key_func)
-        if matched_rule is not None:
-            rule = matched_rule.rule
-            if isinstance(rule.action, Reject):
-                return self._build_reject_response(rule, matched_rule.retry_after)
-            if isinstance(rule.action, Delay):
-                await asyncio.sleep(rule.action.seconds)
+        active_rules = self._collect_active_rules(limiter)
+        self.policy_evaluator.cleanup_expired(active_rules)
+
+        decision = None
+        rules = active_rules.get(handler_name, [])
+        if rules:
+            matched_rule = self._evaluate_policy_rules(
+                request,
+                handler_name,
+                rules,
+                limiter.key_func,
+                getattr(limiter, "trusted_proxy_headers", False),
+            )
+            if matched_rule is not None:
+                decision = matched_rule.rule.action.decide(matched_rule.retry_after)
+                if decision.reject:
+                    response = self._build_reject_response(decision)
+                    await response(scope, receive, send)
+                    return
+                if decision.pre_delay > 0:
+                    await asyncio.sleep(decision.pre_delay)
 
         max_rate = limiter.get_limit(handler_name)
-        if matched_rule is not None and isinstance(matched_rule.rule.action, Throttle):
-            max_rate = matched_rule.rule.action.bytes_per_sec
+        if decision is not None and decision.throttle_rate is not None:
+            max_rate = decision.throttle_rate
 
         if max_rate is None:
-            return await call_next(request)
-            
-        response = await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
-        async def limited_iterator(iterator):
-            async for chunk in iterator:
-                async for limited_chunk in self._yield_limited_chunks(chunk, max_rate):
-                    yield limited_chunk
+        async def send_with_limit(message: Message) -> None:
+            if message["type"] != "http.response.body":
+                await send(message)
+                return
 
-        # レスポンス本文を追加で連結せず、常にストリーミングで制限する
-        if hasattr(response, "body_iterator"):
-            return self._build_streaming_response(response, limited_iterator(response.body_iterator))
+            body = message.get("body", b"")
+            if not body:
+                await send(message)
+                return
 
-        if hasattr(response, "body") and response.body is not None:
-            return self._build_streaming_response(response, limited_iterator(self.response_streamer.iterate_in_chunks(response.body)))
+            await self._send_limited_body(send, body, message.get("more_body", False), max_rate)
 
-        if hasattr(response, "streaming"):
-            response.streaming = limited_iterator(response.streaming)
-
-        return response
+        await self.app(scope, receive, send_with_limit)

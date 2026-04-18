@@ -178,7 +178,7 @@ def test_starlette_small_plain_response_is_delayed_before_first_chunk(recorded_s
 
 
 def test_starlette_policy_rejects_per_ip():
-    limiter = ResponseBandwidthLimiter()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
 
     async def limited(request):
         return PlainTextResponse("ok")

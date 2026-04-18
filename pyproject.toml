@@ -17,10 +17,8 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 
-# 必須の依存関係（これがないとライブラリが動作しない）
-dependencies = [
-    "asyncio>=3.4.3",
-]
+# 必須の依存関係（標準ライブラリは含めない）
+dependencies = []
 
 [project.optional-dependencies]
 # 開発用依存関係（テスト、ドキュメント作成など）

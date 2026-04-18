@@ -1,16 +1,15 @@
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from starlette.responses import JSONResponse
 from starlette.responses import PlainTextResponse
-from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimitExceeded, Rule, Throttle, _response_bandwidth_limit_exceeded_handler, get_endpoint_name, get_route_path
+from response_bandwidth_limiter import ActionProtocol, Delay, PolicyDecision, Reject, ResponseBandwidthLimiter, Rule, Throttle, get_endpoint_name, get_route_path
+from response_bandwidth_limiter.policy import PolicyEvaluator
 
 # デコレータAPIのテスト
 def test_limiter_decorator():
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
     app.state.response_bandwidth_limiter = limiter
-    app.add_exception_handler(ResponseBandwidthLimitExceeded, _response_bandwidth_limit_exceeded_handler)
     
     # 帯域制限付きエンドポイント (200 bytes/sec)
     @app.get("/test")
@@ -127,6 +126,9 @@ def test_rule_and_action_validation_rejects_invalid_types_and_scope():
     with pytest.raises(ValueError):
         Reject(status_code=399)
 
+    with pytest.raises(ValueError):
+        Reject(status_code=600)
+
     with pytest.raises(TypeError):
         Reject(detail=123)
 
@@ -149,26 +151,37 @@ def test_action_priority_values_are_stable():
     assert Throttle(bytes_per_sec=1).priority == 2
 
 
-def test_response_bandwidth_limit_exceeded_exposes_message():
-    exc = ResponseBandwidthLimitExceeded(limit=128, endpoint="download")
+def test_actions_expose_decision_metadata():
+    assert Throttle(bytes_per_sec=8).decide(3) == PolicyDecision(retry_after=3, throttle_rate=8)
+    assert Delay(seconds=0.5).decide(2) == PolicyDecision(retry_after=2, pre_delay=0.5)
+    assert Reject(detail="limited").decide(4) == PolicyDecision(
+        reject=True,
+        reject_status=429,
+        reject_detail="limited",
+        retry_after=4,
+    )
 
-    assert exc.limit == 128
-    assert exc.endpoint == "download"
-    assert exc.message == "Endpoint download is limited to 128 bytes/second"
-    assert str(exc) == exc.message
 
+def test_rule_accepts_custom_action_protocol():
+    class CustomAction:
+        @property
+        def priority(self) -> int:
+            return 5
 
-@pytest.mark.asyncio
-async def test_response_bandwidth_limit_exceeded_handler_returns_json_response():
-    app = FastAPI()
-    request = Request(scope={"type": "http", "app": app, "path": "/download", "method": "GET", "headers": []})
-    exc = ResponseBandwidthLimitExceeded(limit=256, endpoint="download")
+        @property
+        def sort_key(self) -> int:
+            return 1
 
-    response = await _response_bandwidth_limit_exceeded_handler(request, exc)
+        def to_dict(self) -> dict[str, str]:
+            return {"type": "custom"}
 
-    assert isinstance(response, JSONResponse)
-    assert response.status_code == 429
-    assert response.body == b'{"error":"Bandwidth Limit Exceeded","detail":"Endpoint download is limited to 256 bytes/second"}'
+        def decide(self, retry_after: int) -> PolicyDecision:
+            return PolicyDecision(retry_after=retry_after)
+
+    action = CustomAction()
+
+    assert isinstance(action, ActionProtocol)
+    assert Rule(count=1, per="second", action=action).action is action
 
 
 def test_util_functions_return_endpoint_and_route_path():
@@ -190,6 +203,15 @@ def test_get_endpoint_name_falls_back_to_path():
     assert get_endpoint_name(request) == "/fallback"
 
 
+def test_get_endpoint_name_uses_callable_name_when_available():
+    async def endpoint(request: Request):
+        return PlainTextResponse("ok")
+
+    request = Request(scope={"type": "http", "path": "/callable", "endpoint": endpoint, "method": "GET"})
+
+    assert get_endpoint_name(request) == "endpoint"
+
+
 def test_init_app_exposes_policies_and_routes():
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
@@ -201,3 +223,85 @@ def test_init_app_exposes_policies_and_routes():
     assert app.state.response_bandwidth_limiter is limiter
     assert limiter.get_limit("download") == 128
     assert limiter.get_rules("download")[0].count == 1
+
+
+def test_policy_evaluator_limits_counter_growth():
+    evaluator = PolicyEvaluator(time_provider=lambda: 1.0, max_counters=2)
+    rule = Rule(count=1, per="second", action=Reject())
+
+    evaluator.evaluate("client-a", "download", [rule])
+    evaluator.evaluate("client-b", "download", [rule])
+    evaluator.evaluate("client-c", "download", [rule])
+
+    assert len(evaluator.request_counters) == 2
+
+
+def test_action_to_dict_serialization():
+    assert Throttle(bytes_per_sec=100).to_dict() == {"type": "throttle", "bytes_per_sec": 100}
+    assert Delay(seconds=0.5).to_dict() == {"type": "delay", "seconds": 0.5}
+    assert Reject(status_code=503, detail="overloaded").to_dict() == {
+        "type": "reject",
+        "status_code": 503,
+        "detail": "overloaded",
+    }
+
+
+def test_delay_sort_key_prefers_longer_delays():
+    short = Delay(seconds=0.1)
+    long = Delay(seconds=1.0)
+    assert long.sort_key < short.sort_key
+
+
+def test_throttle_sort_key_prefers_lower_rate():
+    slow = Throttle(bytes_per_sec=10)
+    fast = Throttle(bytes_per_sec=1000)
+    assert slow.sort_key < fast.sort_key
+
+
+def test_response_streamer_rejects_invalid_chunk_size():
+    from response_bandwidth_limiter.streaming import ResponseStreamer
+
+    with pytest.raises(ValueError):
+        ResponseStreamer(chunk_size=0)
+    with pytest.raises(ValueError):
+        ResponseStreamer(chunk_size=-1)
+
+
+def test_policy_evaluator_cleanup_expired_removes_stale_counters():
+    now = [0.0]
+    evaluator = PolicyEvaluator(time_provider=lambda: now[0])
+    rule = Rule(count=1, per="second", action=Reject())
+
+    evaluator.evaluate("client-a", "download", [rule])
+    assert len(evaluator.request_counters) == 1
+
+    now[0] = 10.0
+    evaluator.cleanup_expired({"download": [rule]})
+    assert len(evaluator.request_counters) == 0
+
+
+def test_policy_evaluator_cleanup_expired_removes_orphaned_counters():
+    evaluator = PolicyEvaluator(time_provider=lambda: 1.0)
+    rule = Rule(count=1, per="second", action=Reject())
+
+    evaluator.evaluate("client-a", "download", [rule])
+    assert len(evaluator.request_counters) == 1
+
+    evaluator.cleanup_expired({})
+    assert len(evaluator.request_counters) == 0
+
+
+def test_policy_evaluator_selects_highest_priority_action():
+    now = [0.0]
+    evaluator = PolicyEvaluator(time_provider=lambda: now[0])
+    rules = [
+        Rule(count=1, per="second", action=Throttle(bytes_per_sec=100)),
+        Rule(count=1, per="second", action=Reject()),
+        Rule(count=1, per="second", action=Delay(seconds=0.5)),
+    ]
+
+    evaluator.evaluate("client", "endpoint", rules)
+    result = evaluator.evaluate("client", "endpoint", rules)
+
+    assert result is not None
+    assert isinstance(result.rule.action, Reject)

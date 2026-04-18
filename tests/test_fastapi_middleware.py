@@ -218,7 +218,7 @@ def test_policy_rejects_after_threshold_per_ip():
 
 def test_policy_uses_ip_scope_independently():
     app = FastAPI()
-    limiter = ResponseBandwidthLimiter()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
     limiter.init_app(app)
 
     @app.get("/ip-limited")
@@ -273,9 +273,46 @@ def test_get_request_key_prefers_real_ip_and_falls_back_to_scope_client():
         "headers": [],
     })
 
-    assert middleware._get_request_key(real_ip_request, None) == "192.0.2.10"
+    assert middleware._get_request_key(real_ip_request, None, trust_proxy_headers=True) == "192.0.2.10"
     assert middleware._get_request_key(scope_client_request, None) == "198.51.100.7"
     assert middleware._get_request_key(unknown_request, None) == "unknown"
+
+
+def test_get_request_key_ignores_invalid_proxy_header_values():
+    middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
+    request = Request(scope={
+        "type": "http",
+        "path": "/",
+        "method": "GET",
+        "headers": [(b"x-forwarded-for", b"not-an-ip, 203.0.113.5")],
+        "client": ("198.51.100.7", 12345),
+    })
+
+    assert middleware._get_request_key(request, None, trust_proxy_headers=True) == "203.0.113.5"
+
+
+def test_get_request_key_ignores_proxy_headers_by_default():
+    middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
+    request = Request(scope={
+        "type": "http",
+        "path": "/",
+        "method": "GET",
+        "headers": [(b"x-forwarded-for", b"203.0.113.1")],
+        "client": ("198.51.100.7", 12345),
+    })
+
+    assert middleware._get_request_key(request, None) == "198.51.100.7"
+
+
+def test_middleware_accepts_injected_dependencies():
+    app = FastAPI()
+    evaluator = object()
+    streamer = object()
+
+    middleware = ResponseBandwidthLimiterMiddleware(app, policy_evaluator=evaluator, response_streamer=streamer)
+
+    assert middleware.policy_evaluator is evaluator
+    assert middleware.response_streamer is streamer
 
 
 def test_policy_applies_delay_before_handler_execution(recorded_sleep_calls):
@@ -334,3 +371,51 @@ def test_update_route_supports_runtime_bandwidth_changes(recorded_limit_calls):
 
     assert response.status_code == 200
     assert [call["rate"] for call in recorded_limit_calls] == [10]
+
+
+def test_limit_decorator_preserves_fastapi_endpoint_signature(recorded_limit_calls):
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.init_app(app)
+
+    @app.get("/signature")
+    @limiter.limit(10)
+    async def signature_preserved():
+        return PlainTextResponse("ok")
+
+    response = TestClient(app).get("/signature")
+
+    assert response.status_code == 200
+    assert response.text == "ok"
+    assert [call["rate"] for call in recorded_limit_calls] == [10]
+
+
+def test_non_http_scope_passes_through():
+    received_scope = {}
+
+    async def mock_app(scope, receive, send):
+        received_scope.update(scope)
+
+    middleware = ResponseBandwidthLimiterMiddleware(mock_app)
+
+    asyncio.run(middleware({"type": "websocket"}, None, None))
+
+    assert received_scope["type"] == "websocket"
+
+
+def test_empty_body_response_passes_through(recorded_limit_calls):
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.update_route("empty_response", 100)
+    limiter.init_app(app)
+
+    @app.get("/empty")
+    async def empty_response():
+        return PlainTextResponse("")
+
+    client = TestClient(app)
+    response = client.get("/empty")
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert recorded_limit_calls == []
