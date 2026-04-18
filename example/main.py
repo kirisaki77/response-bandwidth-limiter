@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import timedelta
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -28,15 +29,15 @@ async def slow_response():
 @app.get("/policy")
 @limiter.limit_rules([
     Rule(count=2, per="second", action=Throttle(bytes_per_sec=1024)),
-    Rule(count=5, per="minute", action=Delay(seconds=0.25)),
-    Rule(count=10, per="hour", action=Reject(detail="Too many requests from the same IP")),
+    Rule(count=5, per=timedelta(minutes=1), action=Delay(seconds=0.25)),
+    Rule(count=10, per=timedelta(minutes=30), action=Reject(detail="Too many requests from the same IP")),
 ])
 async def policy_response(request: Request):
     return PlainTextResponse(
         "Policy endpoint demo\n"
         "Over 2 requests/second -> throttle to 1024 bytes/sec\n"
         "Over 5 requests/minute -> delay 0.25 seconds\n"
-        "Over 10 requests/hour -> reject with 429\n"
+        "Over 10 requests/30 minutes -> reject with 429\n"
         + ("policy-demo-" * 1024)
     )
 

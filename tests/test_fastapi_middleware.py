@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 
 import pytest
 from fastapi import FastAPI, Request
@@ -211,6 +212,26 @@ def test_policy_rejects_after_threshold_per_ip():
     assert client.get("/limited").status_code == 200
 
     rejected = client.get("/limited")
+    assert rejected.status_code == 429
+    assert rejected.json()["detail"] == "too many requests"
+    assert rejected.headers["Retry-After"] == "1"
+
+
+def test_policy_accepts_timedelta_periods():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.init_app(app)
+
+    @app.get("/timedelta-limited")
+    @limiter.limit_rules([Rule(count=1, per=timedelta(seconds=1), action=Reject(detail="too many requests"))])
+    async def timedelta_limited(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/timedelta-limited").status_code == 200
+
+    rejected = client.get("/timedelta-limited")
     assert rejected.status_code == 429
     assert rejected.json()["detail"] == "too many requests"
     assert rejected.headers["Retry-After"] == "1"

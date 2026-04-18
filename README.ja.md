@@ -57,6 +57,8 @@ limiter.init_app(app)
 ### `limit_rules` による request count policy
 
 ```python
+from datetime import timedelta
+
 from fastapi import FastAPI, Request
 from starlette.responses import PlainTextResponse
 
@@ -68,8 +70,8 @@ limiter = ResponseBandwidthLimiter()
 @app.get("/download")
 @limiter.limit_rules([
     Rule(count=10, per="second", action=Throttle(bytes_per_sec=512)),
-    Rule(count=30, per="minute", action=Delay(seconds=0.5)),
-    Rule(count=200, per="hour", action=Reject(detail="同一IPからのリクエストが多すぎます")),
+    Rule(count=30, per=timedelta(minutes=1), action=Delay(seconds=0.5)),
+    Rule(count=200, per=timedelta(minutes=30), action=Reject(detail="同一IPからのリクエストが多すぎます")),
 ])
 async def download_file(request: Request):
     return PlainTextResponse("payload" * 4096)
@@ -123,6 +125,8 @@ async def set_limit(endpoint: str, limit: int):
 ### policy の更新
 
 ```python
+from datetime import timedelta
+
 from response_bandwidth_limiter import Delay, Reject, Rule, Throttle
 
 @app.get("/admin/set-policy")
@@ -130,11 +134,11 @@ async def set_policy(endpoint: str, mode: str):
     if mode == "throttle":
         limiter.update_policy(endpoint, [
             Rule(count=5, per="second", action=Throttle(bytes_per_sec=256)),
-            Rule(count=20, per="minute", action=Reject(detail="リクエストが多すぎます")),
+            Rule(count=20, per=timedelta(minutes=30), action=Reject(detail="リクエストが多すぎます")),
         ])
     elif mode == "delay":
         limiter.update_policy(endpoint, [
-            Rule(count=3, per="second", action=Delay(seconds=0.25)),
+            Rule(count=3, per=timedelta(seconds=1), action=Delay(seconds=0.25)),
         ])
     else:
         limiter.remove_policy(endpoint)
@@ -192,13 +196,14 @@ class ResponseBandwidthLimiter:
 ### `Rule`, `Reject`, `Delay`, `Throttle`
 
 ```python
-Rule(count: int, per: str, action, scope: str = "ip")
+Rule(count: int, per: str | timedelta, action, scope: str = "ip")
 Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
 Delay(seconds: float)
 Throttle(bytes_per_sec: int)
 ```
 
-- `per` は `second`、`minute`、`hour` をサポートします。
+- `per` は `second`、`minute`、`hour` と、正の `datetime.timedelta` をサポートします。
+- `timedelta` は1秒単位の値だけ受け付けます。
 - `scope` は現状 `ip` のみです。
 - Action には `priority`、`sort_key`、`to_dict()` があります。
 - 複数の rule が同じリクエストに一致した場合、middleware は `priority` が最も小さい action を 1 つだけ選びます。

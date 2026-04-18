@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import timedelta
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -34,7 +35,7 @@ async def set_limit(endpoint: str, limit: int):
 def serialize_rule(rule: Rule) -> dict:
     return {
         "count": rule.count,
-        "per": rule.per,
+        "per": rule.window_seconds,
         "scope": rule.scope,
         "action": rule.action.to_dict(),
     }
@@ -46,12 +47,12 @@ async def set_policy(endpoint: str, mode: str = "throttle"):
     if mode == "throttle":
         limiter.update_policy(endpoint, [
             Rule(count=2, per="second", action=Throttle(bytes_per_sec=256)),
-            Rule(count=10, per="minute", action=Reject(detail="Too many requests from the same IP")),
+            Rule(count=10, per=timedelta(minutes=30), action=Reject(detail="Too many requests from the same IP")),
         ])
     elif mode == "delay":
         limiter.update_policy(endpoint, [
             Rule(count=2, per="second", action=Delay(seconds=0.2)),
-            Rule(count=10, per="minute", action=Reject(detail="Request burst detected")),
+            Rule(count=10, per=timedelta(minutes=30), action=Reject(detail="Request burst detected")),
         ])
     elif mode == "clear":
         limiter.remove_policy(endpoint)
