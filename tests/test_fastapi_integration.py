@@ -8,11 +8,10 @@ from response_bandwidth_limiter import (
     ResponseBandwidthLimitExceeded,
     _response_bandwidth_limit_exceeded_handler,
 )
-import time
 import asyncio
 
 # FastAPIの基本統合テスト
-def test_fastapi_basic_integration():
+def test_fastapi_basic_integration(recorded_limit_calls):
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
     
@@ -44,9 +43,10 @@ def test_fastapi_basic_integration():
     assert len(slow_response.content) == 150
     assert fast_response.status_code == 200
     assert len(fast_response.content) == 150
+    assert [call["rate"] for call in recorded_limit_calls] == [50]
 
 # FastAPIのストリーミングレスポンステスト
-def test_fastapi_streaming_response():
+def test_fastapi_streaming_response(recorded_limit_calls):
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
     app.state.response_bandwidth_limiter = limiter
@@ -69,5 +69,6 @@ def test_fastapi_streaming_response():
     content = response.content
     assert "data_packet0".encode("utf-8") in content
     assert "data_packet4".encode("utf-8") in content
+    assert [call["rate"] for call in recorded_limit_calls] == [100] * 5
 
 # ミドルウェア直接使用テストを削除

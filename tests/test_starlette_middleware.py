@@ -5,10 +5,9 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 from response_bandwidth_limiter import Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule
 from starlette.requests import Request
-import time
 
 # Starletteのミドルウェアテスト
-def test_starlette_middleware():
+def test_starlette_middleware(recorded_limit_calls):
     async def test_endpoint(request):
         return PlainTextResponse("a" * 300)
     
@@ -27,9 +26,10 @@ def test_starlette_middleware():
     
     assert response.status_code == 200
     assert len(response.content) == 300
+    assert [call["rate"] for call in recorded_limit_calls] == [100]
 
 # 帯域制限の実効性テスト（Starlette版）
-def test_starlette_bandwidth_limit_effectiveness():
+def test_starlette_bandwidth_limit_effectiveness(recorded_limit_calls):
     # 高速経路のハンドラー
     async def fast_response(request):
         return PlainTextResponse("a" * 10000)
@@ -58,31 +58,18 @@ def test_starlette_bandwidth_limit_effectiveness():
     app.add_middleware(ResponseBandwidthLimiterMiddleware)
     
     client = TestClient(app)
-    
-    # 高速レスポンスの時間計測
-    start_time = time.time()
+
     fast_response = client.get("/fast")
-    fast_elapsed = time.time() - start_time
-    
-    # 低速レスポンスの時間計測
-    start_time = time.time()
     slow_response = client.get("/slow")
-    slow_elapsed = time.time() - start_time
     
     # レスポンス検証
     assert len(fast_response.content) == 10000
     assert len(slow_response.content) == 10000
-    
-    # 速度比の検証
-    expected_ratio = fast_limit / slow_limit  # 理論上の比率
-    actual_ratio = slow_elapsed / fast_elapsed if fast_elapsed > 0 else 1
-    
-    # テスト環境の不確実性を考慮した緩めの条件
-    assert actual_ratio > (expected_ratio * 0.5), f"Starlette速度制限が期待通り機能していません。高速: {fast_elapsed:.2f}秒, 低速: {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f} (期待: >{expected_ratio * 0.5:.2f})"
-    print(f"Starlette帯域制限の効果を確認: 高速({fast_limit}b/s): {fast_elapsed:.2f}秒, 低速({slow_limit}b/s): {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f}")
+
+    assert [call["rate"] for call in recorded_limit_calls] == [fast_limit, slow_limit]
 
 # ストリーミングレスポンスでの帯域制限テスト（Starlette版）
-def test_starlette_streaming_bandwidth_limit():
+def test_starlette_streaming_bandwidth_limit(recorded_limit_calls):
     chunk_size = 1000  # 各チャンクのサイズ
     chunks = 5  # チャンク数
     
@@ -115,27 +102,15 @@ def test_starlette_streaming_bandwidth_limit():
     app.add_middleware(ResponseBandwidthLimiterMiddleware)
     
     client = TestClient(app)
-    
-    # 時間計測
-    start_time = time.time()
+
     fast_response = client.get("/fast-stream")
-    fast_elapsed = time.time() - start_time
-    
-    start_time = time.time()
     slow_response = client.get("/slow-stream")
-    slow_elapsed = time.time() - start_time
     
     # レスポンスデータの検証
     assert len(fast_response.content) == chunk_size * chunks
     assert len(slow_response.content) == chunk_size * chunks
-    
-    # 速度比の検証
-    expected_ratio = 2000 / 500  # 理論上の比率
-    actual_ratio = slow_elapsed / fast_elapsed if fast_elapsed > 0 else 1
-    
-    # テスト環境を考慮した緩めの条件
-    assert actual_ratio > 1.5, f"Starletteストリーミングでの速度制限が期待通り機能していません。比率: {actual_ratio:.2f}"
-    print(f"Starletteストリーミング帯域制限の効果: 高速: {fast_elapsed:.2f}秒, 低速: {slow_elapsed:.2f}秒, 比率: {actual_ratio:.2f}")
+
+    assert [call["rate"] for call in recorded_limit_calls] == ([2000] * chunks) + ([500] * chunks)
 
 # Starletteのルート解決テスト
 def test_starlette_route_resolution():
@@ -195,7 +170,7 @@ def test_starlette_dynamic_route_resolution():
     mock_request = Request(scope={"type": "http", "app": app, "path": "/items/123", "method": "GET"})
     assert middleware.get_handler_name(mock_request, "/items/123") == "item_endpoint"
 
-def test_starlette_small_plain_response_is_delayed_before_first_chunk():
+def test_starlette_small_plain_response_is_delayed_before_first_chunk(recorded_sleep_calls):
     async def slow_response(request):
         return PlainTextResponse("x" * 20)
 
@@ -208,14 +183,11 @@ def test_starlette_small_plain_response_is_delayed_before_first_chunk():
     app.add_middleware(ResponseBandwidthLimiterMiddleware)
 
     client = TestClient(app)
-
-    start_time = time.time()
     response = client.get("/slow")
-    elapsed = time.time() - start_time
 
     assert response.status_code == 200
     assert response.text == "x" * 20
-    assert elapsed >= 1.5, f"小さいレスポンスでも帯域制限前に即時送信されています: {elapsed:.2f}秒"
+    assert recorded_sleep_calls == pytest.approx([1.0, 1.0])
 
 
 def test_starlette_policy_rejects_per_ip():
