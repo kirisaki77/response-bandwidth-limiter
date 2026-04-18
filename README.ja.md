@@ -50,7 +50,7 @@ async def stream_video(request: Request):
 limiter.init_app(app)
 ```
 
-`init_app()` が正式な登録方法です。middleware の追加、`app.state` への保持、デフォルト例外ハンドラの登録をまとめて行います。
+`init_app()` が正式な登録方法です。middleware の追加と `app.state` への保持をまとめて行います。
 
 ### `limit_rules` による request count policy
 
@@ -147,6 +147,7 @@ async def set_policy(endpoint: str, mode: str):
 - 帯域制限はサーバーサイドで適用されるため、実際の転送速度はネットワーク状況にも依存します。
 - request count policy はメモリ上で管理されます。分散構成ではプロセス間・サーバー間で共有されません。
 - `X-Forwarded-For` を識別に使う場合は、信頼できるリバースプロキシの背後でのみその値を信用してください。
+- 不正な proxy header 値は無視され、middleware は直接接続元のアドレスへフォールバックします。
 
 ## APIリファレンス
 
@@ -154,7 +155,7 @@ async def set_policy(endpoint: str, mode: str):
 
 ```python
 class ResponseBandwidthLimiter:
-    def __init__(self, key_func=None): ...
+    def __init__(self, key_func=None, trusted_proxy_headers: bool = False): ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
     def init_app(self, app): ...
@@ -164,9 +165,21 @@ class ResponseBandwidthLimiter:
     def remove_policy(self, endpoint_name: str): ...
     def get_limit(self, endpoint_name: str) -> int | None: ...
     def get_rules(self, endpoint_name: str) -> list[Rule]: ...
+    @property
+    def routes(self) -> Mapping[str, int]: ...
+    @property
+    def policies(self) -> Mapping[str, list[Rule]]: ...
+    @property
+    def configured_names(self) -> set[str]: ...
 ```
 
 `key_func` を指定すると、request count policy で使うクライアント識別子を独自に決められます。
+`trusted_proxy_headers` の既定値は `False` です。`X-Forwarded-For` や `X-Real-IP` を信頼できるリバースプロキシ配下でのみ `True` にしてください。
+デコレータは limiter の設定だけを登録し、エンドポイントの元のシグネチャは保持されます。
+
+- `routes` は現在設定されている帯域制限を返します。
+- `policies` は現在設定されている request count rule を返します。
+- `configured_names` は route と policy の両方で設定済みの名前集合を返します。
 
 ### `Rule`, `Throttle`, `Delay`, `Reject`
 
@@ -181,23 +194,29 @@ Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
 - `scope` は現状 `ip` のみです。
 - Action には `priority` と `to_dict()` があります。
 
+独自 action を追加する場合は `ActionProtocol` を実装し、`decide()` から `PolicyDecision` を返してください。
+
+`ActionProtocol` には次のメンバーが必要です。
+
+- `priority: int`
+- `sort_key: int | float`
+- `to_dict() -> dict[str, Any]`
+- `decide(retry_after: int) -> PolicyDecision`
+
+`Action` も `ActionProtocol` の型エイリアスとして公開されています。
+
+`PolicyDecision` には、rule が一致したときに middleware が使う次のフィールドがあります。
+
+- `reject`: 直ちにエラーレスポンスを返すかどうか。
+- `reject_status`: reject 時に使う HTTP ステータスコード。
+- `reject_detail`: JSON ボディに返す詳細メッセージ。
+- `retry_after`: `Retry-After` ヘッダーに書き込まれる値。
+- `pre_delay`: エンドポイント実行前に適用される待機時間。
+- `throttle_rate`: レスポンスに一時的に適用される bytes-per-second 制限値。
+
 ### `ResponseBandwidthLimiterMiddleware`
 
 実際に帯域制限と policy を適用する middleware です。通常は手動で追加せず、`limiter.init_app(app)` を使ってください。
-
-### `ResponseBandwidthLimitExceeded`
-
-```python
-class ResponseBandwidthLimitExceeded(Exception):
-    def __init__(self, limit: int, endpoint: str): ...
-```
-
-### `_response_bandwidth_limit_exceeded_handler`
-
-`init_app()` が登録するデフォルトの例外ハンドラです。
-        JSONResponse: HTTPステータスコード429と説明
-    """
-```
 
 ### ユーティリティ関数
 

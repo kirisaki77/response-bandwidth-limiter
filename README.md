@@ -50,7 +50,7 @@ async def stream_video(request: Request):
 limiter.init_app(app)
 ```
 
-`init_app()` is the supported way to register the limiter. It attaches the middleware, stores the limiter on `app.state`, and registers the default error handler.
+`init_app()` is the supported way to register the limiter. It attaches the middleware and stores the limiter on `app.state`.
 
 ### Request-Count Policies with `limit_rules`
 
@@ -147,6 +147,7 @@ For runnable examples, see [example/main.py](example/main.py) and [example/dynam
 - Limits are applied server-side, so real transfer speed also depends on network conditions.
 - Request-count policies are in-memory. In a distributed deployment, counters are not shared across processes or servers.
 - If request identity comes from `X-Forwarded-For`, only trust that header behind a trusted reverse proxy that rewrites or sanitizes it.
+- Malformed proxy header values are ignored and the middleware falls back to the direct client address.
 
 ## API Reference
 
@@ -154,7 +155,7 @@ For runnable examples, see [example/main.py](example/main.py) and [example/dynam
 
 ```python
 class ResponseBandwidthLimiter:
-    def __init__(self, key_func=None): ...
+    def __init__(self, key_func=None, trusted_proxy_headers: bool = False): ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
     def init_app(self, app): ...
@@ -164,9 +165,21 @@ class ResponseBandwidthLimiter:
     def remove_policy(self, endpoint_name: str): ...
     def get_limit(self, endpoint_name: str) -> int | None: ...
     def get_rules(self, endpoint_name: str) -> list[Rule]: ...
+    @property
+    def routes(self) -> Mapping[str, int]: ...
+    @property
+    def policies(self) -> Mapping[str, list[Rule]]: ...
+    @property
+    def configured_names(self) -> set[str]: ...
 ```
 
 `key_func` lets you override the client identifier used by request-count policies.
+`trusted_proxy_headers` is `False` by default. Enable it only behind a trusted reverse proxy that rewrites `X-Forwarded-For` or `X-Real-IP`.
+The decorators only register limiter configuration and preserve the endpoint's original signature.
+
+- `routes` exposes the currently configured bandwidth limits.
+- `policies` exposes the currently configured request-count rules.
+- `configured_names` returns the union of names configured by routes and policies.
 
 ### `Rule`, `Throttle`, `Delay`, `Reject`
 
@@ -181,23 +194,29 @@ Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
 - `scope` currently supports only `ip`.
 - Action instances expose `priority` and `to_dict()`.
 
+Custom policy actions can implement `ActionProtocol` and return a `PolicyDecision` from `decide()`.
+
+`ActionProtocol` requires the following members:
+
+- `priority: int`
+- `sort_key: int | float`
+- `to_dict() -> dict[str, Any]`
+- `decide(retry_after: int) -> PolicyDecision`
+
+`Action` is also exported as an alias of `ActionProtocol`.
+
+`PolicyDecision` contains the fields used by the middleware when a rule matches:
+
+- `reject`: whether to return an error response immediately.
+- `reject_status`: the HTTP status code used when rejecting.
+- `reject_detail`: the error detail returned in the JSON body.
+- `retry_after`: the value written to the `Retry-After` header.
+- `pre_delay`: a delay applied before the endpoint runs.
+- `throttle_rate`: a temporary bytes-per-second rate applied to the response.
+
 ### `ResponseBandwidthLimiterMiddleware`
 
 This is the middleware that applies throttling and request-count policies. In normal usage you should not add it manually; call `limiter.init_app(app)` instead.
-
-### `ResponseBandwidthLimitExceeded`
-
-```python
-class ResponseBandwidthLimitExceeded(Exception):
-    def __init__(self, limit: int, endpoint: str): ...
-```
-
-### `_response_bandwidth_limit_exceeded_handler`
-
-Default exception handler registered by `init_app()`.
-        JSONResponse: With HTTP status code 429 and explanation
-    """
-```
 
 ### Utility Functions
 
