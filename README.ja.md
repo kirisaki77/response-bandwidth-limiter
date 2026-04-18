@@ -89,6 +89,8 @@ async def download_file(request: Request):
     return PlainTextResponse("payload" * 4096)
 ```
 
+FastAPI 上で throttle、delay、reject の段階的な挙動を `/policy` エンドポイントで確認できる実行例として、[example/main.py](example/main.py) も参照してください。
+
 利用できる action:
 
 1. `Throttle(bytes_per_sec=...)`: レスポンスストリームを低速化します。
