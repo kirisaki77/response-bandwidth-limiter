@@ -2,8 +2,10 @@ import threading
 from typing import Callable, Dict, List, Mapping, Optional
 
 from starlette.applications import Starlette
+
 from .middleware import ResponseBandwidthLimiterMiddleware
 from .models import Rule
+from .shutdown import ShutdownCoordinator, ShutdownMode
 
 class ResponseBandwidthLimiter:
     """
@@ -29,6 +31,7 @@ class ResponseBandwidthLimiter:
         self._lock = threading.RLock()
         self._route_limits: Dict[str, int] = {}
         self._route_policies: Dict[str, List[Rule]] = {}
+        self._shutdown_coordinator = ShutdownCoordinator()
         self.key_func = key_func  # slowapi互換のため、キー関数を受け入れる
         self.trusted_proxy_headers = trusted_proxy_headers
 
@@ -69,6 +72,10 @@ class ResponseBandwidthLimiter:
         with self._lock:
             return set(self._route_limits) | set(self._route_policies)
 
+    @property
+    def shutdown_coordinator(self) -> ShutdownCoordinator:
+        return self._shutdown_coordinator
+
     def get_limit(self, endpoint_name: str) -> int | None:
         with self._lock:
             return self._route_limits.get(endpoint_name)
@@ -96,6 +103,13 @@ class ResponseBandwidthLimiter:
     def remove_policy(self, endpoint_name: str) -> None:
         with self._lock:
             self._route_policies.pop(endpoint_name, None)
+
+    def begin_shutdown(self, mode: ShutdownMode) -> None:
+        self._shutdown_coordinator.begin_shutdown(mode)
+
+    async def shutdown(self, mode: ShutdownMode, timeout: float | None = None) -> bool:
+        self.begin_shutdown(mode)
+        return await self._shutdown_coordinator.wait_until_drained(timeout=timeout)
         
     def limit(self, rate: int) -> Callable:
         """
@@ -139,7 +153,7 @@ class ResponseBandwidthLimiter:
 
         return decorator
         
-    def init_app(self, app: Starlette) -> None:
+    def init_app(self, app: Starlette, install_signal_handlers: bool = True) -> None:
         """
         アプリケーションにリミッターを登録する
         
@@ -147,4 +161,8 @@ class ResponseBandwidthLimiter:
             app: FastAPIまたはStarletteアプリケーション
         """
         app.state.response_bandwidth_limiter = self
-        app.add_middleware(ResponseBandwidthLimiterMiddleware)
+        app.add_middleware(
+            ResponseBandwidthLimiterMiddleware,
+            shutdown_coordinator=self._shutdown_coordinator,
+            install_signal_handlers=install_signal_handlers,
+        )

@@ -250,6 +250,27 @@ def test_policy_uses_key_func_instead_of_ip_headers():
     assert client.get("/key-limited", headers={"X-Api-Key": "beta", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
 
 
+def test_policy_falls_back_to_proxy_ip_when_key_func_raises():
+    app = FastAPI()
+
+    def raising_key_func(request: Request) -> str:
+        raise RuntimeError("key lookup failed")
+
+    limiter = ResponseBandwidthLimiter(key_func=raising_key_func, trusted_proxy_headers=True)
+    limiter.init_app(app)
+
+    @app.get("/fallback-key")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="fallback limited"))])
+    async def fallback_key(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/fallback-key", headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 200
+    assert client.get("/fallback-key", headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 429
+    assert client.get("/fallback-key", headers={"X-Forwarded-For": "203.0.113.11"}).status_code == 200
+
+
 def test_get_request_key_prefers_real_ip_and_falls_back_to_scope_client():
     middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
 
@@ -289,6 +310,19 @@ def test_get_request_key_ignores_invalid_proxy_header_values():
     })
 
     assert middleware._get_request_key(request, None, trust_proxy_headers=True) == "203.0.113.5"
+
+
+def test_get_request_key_accepts_ipv6_proxy_headers():
+    middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
+    request = Request(scope={
+        "type": "http",
+        "path": "/",
+        "method": "GET",
+        "headers": [(b"x-forwarded-for", b"bad-value, 2001:db8::10")],
+        "client": ("198.51.100.7", 12345),
+    })
+
+    assert middleware._get_request_key(request, None, trust_proxy_headers=True) == "2001:db8::10"
 
 
 def test_get_request_key_ignores_proxy_headers_by_default():
@@ -373,6 +407,24 @@ def test_update_route_supports_runtime_bandwidth_changes(recorded_limit_calls):
     assert [call["rate"] for call in recorded_limit_calls] == [10]
 
 
+def test_handler_exception_releases_in_flight_counter():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.update_route("failing", 10)
+    limiter.init_app(app, install_signal_handlers=False)
+
+    @app.get("/failing")
+    async def failing():
+        raise RuntimeError("boom")
+
+    client = TestClient(app)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        client.get("/failing")
+
+    assert limiter.shutdown_coordinator.in_flight_count == 0
+
+
 def test_limit_decorator_preserves_fastapi_endpoint_signature(recorded_limit_calls):
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
@@ -415,6 +467,46 @@ def test_empty_body_response_passes_through(recorded_limit_calls):
 
     client = TestClient(app)
     response = client.get("/empty")
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert recorded_limit_calls == []
+
+
+def test_policy_delay_applies_to_empty_body_response(recorded_sleep_calls):
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.init_app(app)
+
+    @app.get("/empty-delay")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Delay(seconds=0.2))])
+    async def empty_delay(request: Request):
+        return PlainTextResponse("")
+
+    client = TestClient(app)
+
+    assert client.get("/empty-delay").status_code == 200
+    response = client.get("/empty-delay")
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert recorded_sleep_calls == pytest.approx([0.2])
+
+
+def test_policy_throttle_skips_limiting_for_empty_body(recorded_limit_calls):
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.init_app(app)
+
+    @app.get("/empty-throttle")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Throttle(bytes_per_sec=10))])
+    async def empty_throttle(request: Request):
+        return PlainTextResponse("")
+
+    client = TestClient(app)
+
+    assert client.get("/empty-throttle").status_code == 200
+    response = client.get("/empty-throttle")
 
     assert response.status_code == 200
     assert response.content == b""

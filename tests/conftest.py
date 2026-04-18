@@ -8,7 +8,7 @@ from response_bandwidth_limiter import ResponseBandwidthLimiterMiddleware
 def recorded_limit_calls(monkeypatch):
     calls = []
 
-    async def fake_yield_limited_chunks(self, chunk, max_rate):
+    async def fake_yield_limited_chunks(self, chunk, max_rate, abort_check=None, poll_check=None):
         calls.append({"chunk": chunk, "size": len(chunk), "rate": max_rate})
         yield chunk
 
