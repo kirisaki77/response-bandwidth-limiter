@@ -10,7 +10,6 @@ from starlette.responses import PlainTextResponse
 app = FastAPI()
 
 limiter = ResponseBandwidthLimiter()
-limiter.init_app(app)
 
 # テスト用データのサイズ
 data_size = 50000  # 50KB
@@ -88,6 +87,7 @@ async def info():
     }
 
 limiter.update_route("get_data", 10000)
+limiter.init_app(app)
 
 # アプリケーション実行
 if __name__ == "__main__":

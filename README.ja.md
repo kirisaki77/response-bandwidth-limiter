@@ -52,6 +52,8 @@ limiter.init_app(app)
 
 `init_app()` が正式な登録方法です。middleware の追加と `app.state` への保持をまとめて行います。
 
+`init_app(app, install_signal_handlers=True)` は既定で `SIGINT` と連動する shutdown 制御も有効化します。1回目の `Ctrl+C` で drain モードに入り、新しい帯域制限付きレスポンスは `503` で拒否し、進行中の帯域制限レスポンスは継続します。2回目の `Ctrl+C` では abort モードへ昇格し、レスポンス完了まで待たずに帯域制限中の送信を停止します。shutdown を自前で制御したい場合は `install_signal_handlers=False` を指定してください。
+
 ### `limit_rules` による request count policy
 
 ```python
@@ -75,11 +77,13 @@ async def download_file(request: Request):
 limiter.init_app(app)
 ```
 
-利用できる action:
+複数の rule が同じリクエストに一致した場合、middleware は action をすべて順番に適用せず、1つだけ選んで適用します。選択には action の priority を最優先で使い、その後に `sort_key`、最後に `limit_rules([...])` 内での定義順を使います。
 
-1. `Throttle(bytes_per_sec=...)`: レスポンスストリームを低速化します。
+利用できる action。複数一致時の選択優先順で並べています:
+
+1. `Reject(status_code=429, detail=...)`: エラー応答を返します。
 2. `Delay(seconds=...)`: エンドポイント実行前に待機します。
-3. `Reject(status_code=429, detail=...)`: エラー応答を返します。
+3. `Throttle(bytes_per_sec=...)`: レスポンスストリームを低速化します。
 
 ### Starlette
 
@@ -158,13 +162,17 @@ class ResponseBandwidthLimiter:
     def __init__(self, key_func=None, trusted_proxy_headers: bool = False): ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
-    def init_app(self, app): ...
+    def init_app(self, app, install_signal_handlers: bool = True): ...
+    def begin_shutdown(self, mode: ShutdownMode): ...
+    async def shutdown(self, mode: ShutdownMode, timeout: float | None = None) -> bool: ...
     def update_route(self, endpoint_name: str, rate: int): ...
     def remove_route(self, endpoint_name: str): ...
     def update_policy(self, endpoint_name: str, rules: list[Rule]): ...
     def remove_policy(self, endpoint_name: str): ...
     def get_limit(self, endpoint_name: str) -> int | None: ...
     def get_rules(self, endpoint_name: str) -> list[Rule]: ...
+    @property
+    def shutdown_coordinator(self) -> ShutdownCoordinator: ...
     @property
     def routes(self) -> Mapping[str, int]: ...
     @property
@@ -181,20 +189,24 @@ class ResponseBandwidthLimiter:
 - `policies` は現在設定されている request count rule を返します。
 - `configured_names` は route と policy の両方で設定済みの名前集合を返します。
 
-### `Rule`, `Throttle`, `Delay`, `Reject`
+### `Rule`, `Reject`, `Delay`, `Throttle`
 
 ```python
 Rule(count: int, per: str, action, scope: str = "ip")
-Throttle(bytes_per_sec: int)
-Delay(seconds: float)
 Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
+Delay(seconds: float)
+Throttle(bytes_per_sec: int)
 ```
 
 - `per` は `second`、`minute`、`hour` をサポートします。
 - `scope` は現状 `ip` のみです。
-- Action には `priority` と `to_dict()` があります。
+- Action には `priority`、`sort_key`、`to_dict()` があります。
+- 複数の rule が同じリクエストに一致した場合、middleware は `priority` が最も小さい action を 1 つだけ選びます。
+- 組み込み action の優先順は `Reject` (0)、`Delay` (1)、`Throttle` (2) です。
+- `priority` が同じ場合は `sort_key` が小さいほうを選びます。組み込み action では、`Delay` は待機時間が長いほう、`Throttle(bytes_per_sec=...)` は bytes-per-second が低いほうが優先されます。
+- `priority` と `sort_key` も同じ場合は、`limit_rules([...])` 内で先に定義された rule を選びます。
 
-独自 action を追加する場合は `ActionProtocol` を実装し、`decide()` から `PolicyDecision` を返してください。
+独自 action を追加する場合は `ActionProtocol` を実装し、`decide()` から `PolicyDecision` を返してください。`priority` と `sort_key` は複数一致時の競合解決に使われるため、値の設計もあわせて行ってください。
 
 `ActionProtocol` には次のメンバーが必要です。
 

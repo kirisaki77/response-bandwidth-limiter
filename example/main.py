@@ -11,7 +11,6 @@ from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, 
 app = FastAPI()
 
 limiter = ResponseBandwidthLimiter()
-limiter.init_app(app)
 
 payload = ("bandwidth-demo-" * 1024).encode("utf-8")
 
@@ -40,6 +39,8 @@ async def policy_response(request: Request):
         "Over 10 requests/hour -> reject with 429\n"
         + ("policy-demo-" * 1024)
     )
+
+limiter.init_app(app)
 
 # DevTools Consoleでの確認例:
 # const slowStart = performance.now();

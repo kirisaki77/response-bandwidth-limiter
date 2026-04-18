@@ -1,5 +1,8 @@
 import asyncio
+import signal
+import threading
 from ipaddress import ip_address
+from types import FrameType
 from typing import Any, AsyncIterator, Callable, Optional
 
 from starlette.requests import Request
@@ -9,7 +12,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .models import PolicyDecision, Rule
 from .policy import MatchedPolicy, PolicyEvaluator
-from .streaming import ResponseStreamer
+from .shutdown import ShutdownCoordinator, ShutdownMode
+from .streaming import ResponseStreamer, StreamingAbortedError
 
 class ResponseBandwidthLimiterMiddleware:
     chunk_size = 8192
@@ -19,6 +23,8 @@ class ResponseBandwidthLimiterMiddleware:
         app: ASGIApp,
         policy_evaluator: Optional[PolicyEvaluator] = None,
         response_streamer: Optional[ResponseStreamer] = None,
+        shutdown_coordinator: Optional[ShutdownCoordinator] = None,
+        install_signal_handlers: bool = True,
     ):
         """
         帯域制限ミドルウェア
@@ -29,6 +35,11 @@ class ResponseBandwidthLimiterMiddleware:
         self.app = app
         self.policy_evaluator = policy_evaluator or PolicyEvaluator()
         self.response_streamer = response_streamer or ResponseStreamer(chunk_size=self.chunk_size, sleep_func=asyncio.sleep)
+        self.shutdown_coordinator = shutdown_coordinator or ShutdownCoordinator()
+        self.install_signal_handlers = install_signal_handlers
+        self._signal_lock = threading.Lock()
+        self._signal_handler_installed = False
+        self._original_sigint_handler: Any = None
 
     def _get_limit_name(self, route: Any, endpoint: Any, path: str, configured_names: set[str]) -> Optional[str]:
         endpoint_name = getattr(endpoint, "__name__", None)
@@ -76,9 +87,61 @@ class ResponseBandwidthLimiterMiddleware:
 
         return None
 
-    async def _yield_limited_chunks(self, chunk: bytes, max_rate: int) -> AsyncIterator[bytes]:
-        async for part in self.response_streamer.yield_limited_chunks(chunk, max_rate):
+    async def _yield_limited_chunks(
+        self,
+        chunk: bytes,
+        max_rate: int,
+        abort_check: Callable[[], bool] | None = None,
+        poll_check: Callable[[], bool] | None = None,
+    ) -> AsyncIterator[bytes]:
+        async for part in self.response_streamer.yield_limited_chunks(
+            chunk,
+            max_rate,
+            abort_check=abort_check,
+            poll_check=poll_check,
+        ):
             yield part
+
+    def _handle_sigint(self, signum: int, frame: FrameType | None) -> None:
+        next_mode = ShutdownMode.ABORT if self.shutdown_coordinator.is_shutting_down else ShutdownMode.DRAIN
+        self.shutdown_coordinator.begin_shutdown(next_mode)
+
+        with self._signal_lock:
+            original_handler = self._original_sigint_handler
+
+        if original_handler in (None, signal.SIG_IGN):
+            return
+        if original_handler == signal.SIG_DFL:
+            signal.default_int_handler(signum, frame)
+            return
+        if original_handler is self._handle_sigint:
+            return
+
+        original_handler(signum, frame)
+
+    def _install_signal_handler(self) -> None:
+        if not self.install_signal_handlers:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        with self._signal_lock:
+            if self._signal_handler_installed:
+                return
+            self._original_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, self._handle_sigint)
+            self._signal_handler_installed = True
+
+    def _restore_signal_handler(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        with self._signal_lock:
+            if not self._signal_handler_installed:
+                return
+            signal.signal(signal.SIGINT, self._original_sigint_handler)
+            self._signal_handler_installed = False
+            self._original_sigint_handler = None
 
     def _extract_valid_ip(self, raw_value: Optional[str]) -> Optional[str]:
         if raw_value is None:
@@ -103,7 +166,10 @@ class ResponseBandwidthLimiterMiddleware:
         trust_proxy_headers: bool = False,
     ) -> str:
         if callable(key_func):
-            return str(key_func(request))
+            try:
+                return str(key_func(request))
+            except Exception:
+                pass
 
         if trust_proxy_headers:
             forwarded_ip = self._extract_valid_ip(request.headers.get("x-forwarded-for"))
@@ -152,6 +218,15 @@ class ResponseBandwidthLimiterMiddleware:
             },
         )
 
+    def _build_shutdown_response(self) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Server shutting down",
+                "detail": "The server is shutting down and cannot accept throttled responses.",
+            },
+        )
+
     def _collect_active_rules(self, limiter: Any) -> dict[str, list[Rule]]:
         active_rules: dict[str, list[Rule]] = {}
         for name in limiter.configured_names:
@@ -183,9 +258,22 @@ class ResponseBandwidthLimiterMiddleware:
         routes = getattr(app, "routes", [])
         return self._find_handler_name(routes, request.scope, path, configured_names)
 
-    async def _send_limited_body(self, send: Send, body: bytes, more_body: bool, max_rate: int) -> None:
+    async def _send_limited_body(
+        self,
+        send: Send,
+        body: bytes,
+        more_body: bool,
+        max_rate: int,
+        abort_check: Callable[[], bool] | None = None,
+        poll_check: Callable[[], bool] | None = None,
+    ) -> None:
         pending_chunk: Optional[bytes] = None
-        async for limited_chunk in self._yield_limited_chunks(body, max_rate):
+        async for limited_chunk in self._yield_limited_chunks(
+            body,
+            max_rate,
+            abort_check=abort_check,
+            poll_check=poll_check,
+        ):
             if pending_chunk is not None:
                 await send({"type": "http.response.body", "body": pending_chunk, "more_body": True})
             pending_chunk = limited_chunk
@@ -196,7 +284,27 @@ class ResponseBandwidthLimiterMiddleware:
 
         await send({"type": "http.response.body", "body": pending_chunk, "more_body": more_body})
 
+    async def _handle_lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not self.install_signal_handlers:
+            await self.app(scope, receive, send)
+            return
+
+        async def receive_with_signal() -> Message:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                self._install_signal_handler()
+            return message
+
+        try:
+            await self.app(scope, receive_with_signal, send)
+        finally:
+            self._restore_signal_handler()
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            await self._handle_lifespan(scope, receive, send)
+            return
+
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -213,6 +321,13 @@ class ResponseBandwidthLimiterMiddleware:
 
         if handler_name is None:
             await self.app(scope, receive, send)
+            return
+
+        route_limit = limiter.get_limit(handler_name)
+        route_rules = limiter.get_rules(handler_name)
+        if self.shutdown_coordinator.is_shutting_down and (route_limit is not None or route_rules):
+            response = self._build_shutdown_response()
+            await response(scope, receive, send)
             return
 
         active_rules = self._collect_active_rules(limiter)
@@ -237,13 +352,16 @@ class ResponseBandwidthLimiterMiddleware:
                 if decision.pre_delay > 0:
                     await asyncio.sleep(decision.pre_delay)
 
-        max_rate = limiter.get_limit(handler_name)
+        max_rate = route_limit
         if decision is not None and decision.throttle_rate is not None:
             max_rate = decision.throttle_rate
 
         if max_rate is None:
             await self.app(scope, receive, send)
             return
+
+        abort_check = lambda: self.shutdown_coordinator.should_abort
+        poll_check = lambda: self.shutdown_coordinator.is_shutting_down
 
         async def send_with_limit(message: Message) -> None:
             if message["type"] != "http.response.body":
@@ -255,6 +373,20 @@ class ResponseBandwidthLimiterMiddleware:
                 await send(message)
                 return
 
-            await self._send_limited_body(send, body, message.get("more_body", False), max_rate)
+            await self._send_limited_body(
+                send,
+                body,
+                message.get("more_body", False),
+                max_rate,
+                abort_check=abort_check,
+                poll_check=poll_check,
+            )
 
-        await self.app(scope, receive, send_with_limit)
+        self.shutdown_coordinator.enter_response()
+        try:
+            try:
+                await self.app(scope, receive, send_with_limit)
+            except StreamingAbortedError:
+                return
+        finally:
+            self.shutdown_coordinator.exit_response()

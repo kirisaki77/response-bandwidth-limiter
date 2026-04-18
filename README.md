@@ -52,6 +52,8 @@ limiter.init_app(app)
 
 `init_app()` is the supported way to register the limiter. It attaches the middleware and stores the limiter on `app.state`.
 
+`init_app(app, install_signal_handlers=True)` also installs shutdown-aware `SIGINT` handling by default. The first `Ctrl+C` moves the limiter into drain mode, rejects new throttled responses with `503`, and lets existing throttled responses continue. A second `Ctrl+C` promotes shutdown to abort mode and stops in-flight throttled streaming without waiting for the full response to finish. Set `install_signal_handlers=False` if you want to manage shutdown yourself.
+
 ### Request-Count Policies with `limit_rules`
 
 ```python
@@ -75,11 +77,13 @@ async def download_file(request: Request):
 limiter.init_app(app)
 ```
 
-Available actions:
+If multiple rules match the same request, the middleware applies only one action. Selection uses action priority first, then `sort_key`, and finally the rule order in the `limit_rules([...])` list.
 
-1. `Throttle(bytes_per_sec=...)`: slows the response stream.
+Available actions, ordered by selection priority when multiple rules match:
+
+1. `Reject(status_code=429, detail=...)`: returns an error response.
 2. `Delay(seconds=...)`: waits before the endpoint handler runs.
-3. `Reject(status_code=429, detail=...)`: returns an error response.
+3. `Throttle(bytes_per_sec=...)`: slows the response stream.
 
 ### Starlette
 
@@ -158,13 +162,17 @@ class ResponseBandwidthLimiter:
     def __init__(self, key_func=None, trusted_proxy_headers: bool = False): ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
-    def init_app(self, app): ...
+    def init_app(self, app, install_signal_handlers: bool = True): ...
+    def begin_shutdown(self, mode: ShutdownMode): ...
+    async def shutdown(self, mode: ShutdownMode, timeout: float | None = None) -> bool: ...
     def update_route(self, endpoint_name: str, rate: int): ...
     def remove_route(self, endpoint_name: str): ...
     def update_policy(self, endpoint_name: str, rules: list[Rule]): ...
     def remove_policy(self, endpoint_name: str): ...
     def get_limit(self, endpoint_name: str) -> int | None: ...
     def get_rules(self, endpoint_name: str) -> list[Rule]: ...
+    @property
+    def shutdown_coordinator(self) -> ShutdownCoordinator: ...
     @property
     def routes(self) -> Mapping[str, int]: ...
     @property
@@ -181,20 +189,24 @@ The decorators only register limiter configuration and preserve the endpoint's o
 - `policies` exposes the currently configured request-count rules.
 - `configured_names` returns the union of names configured by routes and policies.
 
-### `Rule`, `Throttle`, `Delay`, `Reject`
+### `Rule`, `Reject`, `Delay`, `Throttle`
 
 ```python
 Rule(count: int, per: str, action, scope: str = "ip")
-Throttle(bytes_per_sec: int)
-Delay(seconds: float)
 Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
+Delay(seconds: float)
+Throttle(bytes_per_sec: int)
 ```
 
 - `per` supports `second`, `minute`, and `hour`.
 - `scope` currently supports only `ip`.
-- Action instances expose `priority` and `to_dict()`.
+- Action instances expose `priority`, `sort_key`, and `to_dict()`.
+- If multiple rules match the same request, the middleware selects a single action with the lowest `priority` value.
+- The built-in priority order is `Reject` (0), `Delay` (1), then `Throttle` (2).
+- If priorities are equal, the action with the lower `sort_key` wins. For the built-in actions, that means longer `Delay` values win over shorter ones, and lower `Throttle(bytes_per_sec=...)` values win over higher ones.
+- If both `priority` and `sort_key` are equal, the rule defined earlier in the `limit_rules([...])` list is selected.
 
-Custom policy actions can implement `ActionProtocol` and return a `PolicyDecision` from `decide()`.
+Custom policy actions can implement `ActionProtocol` and return a `PolicyDecision` from `decide()`. Choose `priority` and `sort_key` values carefully, because the middleware uses them to resolve conflicts between multiple matched rules.
 
 `ActionProtocol` requires the following members:
 
