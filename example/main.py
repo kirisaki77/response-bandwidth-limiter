@@ -27,6 +27,19 @@ async def fast_response():
 async def slow_response():
     return {"message": "This response is slower"}
 
+# DevTools Consoleでの確認例:
+# const slowStart = performance.now();
+# let res = await fetch("http://127.0.0.1:8000/slow", { cache: "no-store" });
+# await res.text();
+# const slowEnd = performance.now();
+# console.log(`slow 通信時間: ${slowEnd - slowStart} ms`);
+#
+# const fastStart = performance.now();
+# res = await fetch("http://127.0.0.1:8000/fast", { cache: "no-store" });
+# await res.text();
+# const fastEnd = performance.now();
+# console.log(`fast 通信時間: ${fastEnd - fastStart} ms`);
+
 # アプリケーション実行
 if __name__ == "__main__":
     import uvicorn
@@ -35,4 +48,5 @@ if __name__ == "__main__":
     print("  - http://127.0.0.1:8000/ (使用方法)")
     print("  - http://127.0.0.1:8000/fast (制限を100 bytes/secに変更)")
     print("  - http://127.0.0.1:8000/slow (制限を10 bytes/secに変更)")
+    print("ブラウザのDevTools Consoleで/slowと/fastの通信時間を比較できます")
     uvicorn.run(app, host="127.0.0.1", port=8000)
