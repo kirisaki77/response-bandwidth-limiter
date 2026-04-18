@@ -26,3 +26,13 @@ async def fast_response():
 @app.get("/slow")
 async def slow_response():
     return {"message": "This response is slower"}
+
+# アプリケーション実行
+if __name__ == "__main__":
+    import uvicorn
+    print("デモを開始します...")
+    print("以下のURLで動作確認できます:")
+    print("  - http://127.0.0.1:8000/ (使用方法)")
+    print("  - http://127.0.0.1:8000/fast (制限を100 bytes/secに変更)")
+    print("  - http://127.0.0.1:8000/slow (制限を10 bytes/secに変更)")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
