@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
@@ -110,6 +112,12 @@ def test_rule_and_action_validation():
         Rule(count=1, per="day", action=Reject())
 
     with pytest.raises(ValueError):
+        Rule(count=1, per=timedelta(), action=Reject())
+
+    with pytest.raises(ValueError):
+        Rule(count=1, per=timedelta(milliseconds=500), action=Reject())
+
+    with pytest.raises(ValueError):
         Throttle(bytes_per_sec=0)
 
     with pytest.raises(ValueError):
@@ -136,6 +144,9 @@ def test_rule_and_action_validation_rejects_invalid_types_and_scope():
         Rule(count=1, per="second", action=Reject(), scope="global")
 
     with pytest.raises(TypeError):
+        Rule(count=1, per=123, action=Reject())
+
+    with pytest.raises(TypeError):
         Rule(count=1, per="second", action="invalid")
 
 
@@ -143,6 +154,12 @@ def test_rule_window_seconds_supports_all_periods():
     assert Rule(count=1, per="second", action=Reject()).window_seconds == 1
     assert Rule(count=1, per="minute", action=Reject()).window_seconds == 60
     assert Rule(count=1, per="hour", action=Reject()).window_seconds == 3600
+
+
+def test_rule_window_seconds_supports_timedelta_periods():
+    assert Rule(count=1, per=timedelta(seconds=1), action=Reject()).window_seconds == 1
+    assert Rule(count=1, per=timedelta(minutes=30), action=Reject()).window_seconds == 1800
+    assert Rule(count=1, per=timedelta(hours=1), action=Reject()).window_seconds == 3600
 
 
 def test_action_priority_values_are_stable():

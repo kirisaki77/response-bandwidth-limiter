@@ -57,6 +57,8 @@ limiter.init_app(app)
 ### Request-Count Policies with `limit_rules`
 
 ```python
+from datetime import timedelta
+
 from fastapi import FastAPI, Request
 from starlette.responses import PlainTextResponse
 
@@ -68,8 +70,8 @@ limiter = ResponseBandwidthLimiter()
 @app.get("/download")
 @limiter.limit_rules([
     Rule(count=10, per="second", action=Throttle(bytes_per_sec=512)),
-    Rule(count=30, per="minute", action=Delay(seconds=0.5)),
-    Rule(count=200, per="hour", action=Reject(detail="Too many downloads from the same IP")),
+    Rule(count=30, per=timedelta(minutes=1), action=Delay(seconds=0.5)),
+    Rule(count=200, per=timedelta(minutes=30), action=Reject(detail="Too many downloads from the same IP")),
 ])
 async def download_file(request: Request):
     return PlainTextResponse("payload" * 4096)
@@ -123,6 +125,8 @@ async def set_limit(endpoint: str, limit: int):
 ### Update request-count policies
 
 ```python
+from datetime import timedelta
+
 from response_bandwidth_limiter import Delay, Reject, Rule, Throttle
 
 @app.get("/admin/set-policy")
@@ -130,11 +134,11 @@ async def set_policy(endpoint: str, mode: str):
     if mode == "throttle":
         limiter.update_policy(endpoint, [
             Rule(count=5, per="second", action=Throttle(bytes_per_sec=256)),
-            Rule(count=20, per="minute", action=Reject(detail="Too many requests")),
+            Rule(count=20, per=timedelta(minutes=30), action=Reject(detail="Too many requests")),
         ])
     elif mode == "delay":
         limiter.update_policy(endpoint, [
-            Rule(count=3, per="second", action=Delay(seconds=0.25)),
+            Rule(count=3, per=timedelta(seconds=1), action=Delay(seconds=0.25)),
         ])
     else:
         limiter.remove_policy(endpoint)
@@ -192,13 +196,14 @@ The decorators only register limiter configuration and preserve the endpoint's o
 ### `Rule`, `Reject`, `Delay`, `Throttle`
 
 ```python
-Rule(count: int, per: str, action, scope: str = "ip")
+Rule(count: int, per: str | timedelta, action, scope: str = "ip")
 Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
 Delay(seconds: float)
 Throttle(bytes_per_sec: int)
 ```
 
-- `per` supports `second`, `minute`, and `hour`.
+- `per` supports `second`, `minute`, `hour`, and positive `datetime.timedelta` values.
+- `timedelta` values must be whole-second durations.
 - `scope` currently supports only `ip`.
 - Action instances expose `priority`, `sort_key`, and `to_dict()`.
 - If multiple rules match the same request, the middleware selects a single action with the lowest `priority` value.

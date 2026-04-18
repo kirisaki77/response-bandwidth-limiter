@@ -1,8 +1,27 @@
+from datetime import timedelta
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 
 VALID_PERIODS = {"second": 1, "minute": 60, "hour": 3600}
+
+
+def _resolve_window_seconds(period: str | timedelta) -> int:
+    if isinstance(period, str):
+        if period not in VALID_PERIODS:
+            raise ValueError("per は second, minute, hour のいずれか、または正の timedelta である必要があります。")
+        return VALID_PERIODS[period]
+
+    if not isinstance(period, timedelta):
+        raise TypeError("per は文字列または timedelta である必要があります。")
+
+    if period <= timedelta(0):
+        raise ValueError("per に timedelta を指定する場合は0より大きい必要があります。")
+
+    if period.microseconds != 0:
+        raise ValueError("per に timedelta を指定する場合は1秒単位である必要があります。")
+
+    return int(period.total_seconds())
 
 
 @dataclass(frozen=True)
@@ -123,7 +142,7 @@ Action = ActionProtocol
 @dataclass(frozen=True)
 class Rule:
     count: int
-    per: str
+    per: str | timedelta
     action: Action
     scope: str = "ip"
 
@@ -132,8 +151,7 @@ class Rule:
             raise TypeError("count は整数である必要があります。")
         if self.count <= 0:
             raise ValueError("count は1以上である必要があります。")
-        if self.per not in VALID_PERIODS:
-            raise ValueError("per は second, minute, hour のいずれかである必要があります。")
+        _resolve_window_seconds(self.per)
         if self.scope != "ip":
             raise ValueError("scope は現在 ip のみ対応しています。")
         if not isinstance(self.action, ActionProtocol):
@@ -141,4 +159,4 @@ class Rule:
 
     @property
     def window_seconds(self) -> int:
-        return VALID_PERIODS[self.per]
+        return _resolve_window_seconds(self.per)
