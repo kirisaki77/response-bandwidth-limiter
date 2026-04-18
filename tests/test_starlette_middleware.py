@@ -151,13 +151,13 @@ def test_starlette_route_resolution():
     middleware = ResponseBandwidthLimiterMiddleware(app)
     
     # モックリクエストを作成
-    mock_request = Request(scope={"type": "http", "app": app, "path": "/test"})
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/test", "method": "GET"})
     
     # ルート名でルートを見つけられるか（新しいシグネチャに合わせて更新）
     assert middleware.get_handler_name(mock_request, "/test") == "test_route"
     
     # 存在しないパスに対して
-    mock_request = Request(scope={"type": "http", "app": app, "path": "/not-exist"})
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/not-exist", "method": "GET"})
     assert middleware.get_handler_name(mock_request, "/not-exist") is None
 
 # Starletteのネストされたルートテスト
@@ -174,7 +174,45 @@ def test_starlette_nested_routes():
     middleware = ResponseBandwidthLimiterMiddleware(app)
     
     # モックリクエスト
-    mock_request = Request(scope={"type": "http", "app": app, "path": "/api/data"})
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/api/data", "method": "GET"})
     
     # 複雑なパスでも正しくルートを解決できるか
     assert middleware.get_handler_name(mock_request, "/api/data") == "api_endpoint"
+
+# Starletteの動的ルート解決テスト
+def test_starlette_dynamic_route_resolution():
+    async def item_endpoint(request):
+        return PlainTextResponse("item")
+
+    routes = [
+        Route("/items/{item_id}", endpoint=item_endpoint, name="item_endpoint"),
+    ]
+
+    app = Starlette(routes=routes)
+    app.state.response_bandwidth_limits = {"item_endpoint": 100}
+    middleware = ResponseBandwidthLimiterMiddleware(app)
+
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/items/123", "method": "GET"})
+    assert middleware.get_handler_name(mock_request, "/items/123") == "item_endpoint"
+
+def test_starlette_small_plain_response_is_delayed_before_first_chunk():
+    async def slow_response(request):
+        return PlainTextResponse("x" * 20)
+
+    routes = [
+        Route("/slow", endpoint=slow_response, name="slow_response"),
+    ]
+
+    app = Starlette(routes=routes)
+    app.state.response_bandwidth_limits = {"slow_response": 10}
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    client = TestClient(app)
+
+    start_time = time.time()
+    response = client.get("/slow")
+    elapsed = time.time() - start_time
+
+    assert response.status_code == 200
+    assert response.text == "x" * 20
+    assert elapsed >= 1.5, f"小さいレスポンスでも帯域制限前に即時送信されています: {elapsed:.2f}秒"

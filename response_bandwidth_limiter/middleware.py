@@ -1,11 +1,15 @@
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import StreamingResponse
+from starlette.routing import Match
 import asyncio
-from typing import Dict, Callable, Any, List, Optional
+from typing import Dict, Any, List, Optional, AsyncIterator
 from .errors import ResponseBandwidthLimitExceeded
 from .decorator import endpoint_bandwidth_limits
 
 class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
+    chunk_size = 8192
+
     def __init__(self, app: Any):
         """
         帯域制限ミドルウェア
@@ -19,6 +23,75 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
     def get_routes(self) -> List[Any]:
         """アプリケーションからルート情報を取得"""
         return getattr(self.app, "routes", [])
+
+    def _get_limit_name(self, route: Any, endpoint: Any, path: str, combined_limits: Dict[str, int]) -> Optional[str]:
+        endpoint_name = getattr(endpoint, "__name__", None)
+        if endpoint_name in combined_limits:
+            return endpoint_name
+
+        route_name = getattr(route, "name", None)
+        if route_name in combined_limits:
+            return route_name
+
+        route_path = getattr(route, "path", path).strip("/")
+        if route_path in combined_limits:
+            return route_path
+
+        if endpoint_name:
+            for suffix in ["_response", "_endpoint"]:
+                if endpoint_name.endswith(suffix):
+                    base_name = endpoint_name[:-len(suffix)]
+                    if base_name in combined_limits:
+                        return base_name
+
+        return None
+
+    def _find_handler_name(self, routes: List[Any], scope: Dict[str, Any], path: str, combined_limits: Dict[str, int]) -> Optional[str]:
+        for route in routes:
+            if not hasattr(route, "matches"):
+                continue
+
+            match, child_scope = route.matches(scope)
+            if match != Match.FULL:
+                continue
+
+            endpoint = child_scope.get("endpoint", getattr(route, "endpoint", None))
+            handler_name = self._get_limit_name(route, endpoint, path, combined_limits)
+            if handler_name is not None:
+                return handler_name
+
+            nested_routes = getattr(route, "routes", None)
+            if nested_routes:
+                nested_scope = scope.copy()
+                nested_scope.update(child_scope)
+                handler_name = self._find_handler_name(nested_routes, nested_scope, path, combined_limits)
+                if handler_name is not None:
+                    return handler_name
+
+        return None
+
+    async def _iterate_in_chunks(self, body: bytes):
+        for index in range(0, len(body), self.chunk_size):
+            yield body[index:index + self.chunk_size]
+
+    async def _yield_limited_chunks(self, chunk: bytes, max_rate: int) -> AsyncIterator[bytes]:
+        effective_chunk_size = max(1, min(self.chunk_size, max_rate))
+        for index in range(0, len(chunk), effective_chunk_size):
+            part = chunk[index:index + effective_chunk_size]
+            if not part:
+                continue
+            await asyncio.sleep(len(part) / max_rate)
+            yield part
+
+    def _build_streaming_response(self, response: Any, iterator: Any) -> StreamingResponse:
+        streaming_response = StreamingResponse(
+            iterator,
+            status_code=response.status_code,
+            media_type=response.media_type,
+            background=response.background,
+        )
+        streaming_response.raw_headers = list(response.raw_headers)
+        return streaming_response
         
     def get_handler_name(self, request: Request, path: str) -> Optional[str]:
         """
@@ -48,33 +121,7 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
         
         # ルートを探索
         routes = getattr(app, "routes", [])
-        for route in routes:
-            if hasattr(route, "path") and route.path == path:
-                # まず関数名で確認
-                if hasattr(route, "endpoint") and hasattr(route.endpoint, "__name__"):
-                    endpoint_name = route.endpoint.__name__
-                    if endpoint_name in combined_limits:
-                        return endpoint_name
-                
-                # ルート名で確認
-                if hasattr(route, "name") and route.name in combined_limits:
-                    return route.name
-                
-                # FastAPIではルートにname属性が設定されていない場合があるので、
-                # pathからルート名を取得してみる（"/fast" → "fast"）
-                route_name = path.strip("/")
-                if route_name in combined_limits:
-                    return route_name
-                
-                # エンドポイント関数名から"_response"などのサフィックスを取り除いた名前も確認
-                if hasattr(route, "endpoint") and hasattr(route.endpoint, "__name__"):
-                    base_name = route.endpoint.__name__
-                    for suffix in ["_response", "_endpoint"]:
-                        if base_name.endswith(suffix):
-                            base_name = base_name[:-len(suffix)]
-                            if base_name in combined_limits:
-                                return base_name
-        return None
+        return self._find_handler_name(routes, request.scope, path, combined_limits)
 
     async def dispatch(self, request: Request, call_next):
         """リクエストに対して帯域制限を適用"""
@@ -104,18 +151,17 @@ class ResponseBandwidthLimiterMiddleware(BaseHTTPMiddleware):
 
         async def limited_iterator(iterator):
             async for chunk in iterator:
-                yield chunk
-                if len(chunk) > 0:  # 0バイト分割を避ける
-                    await asyncio.sleep(len(chunk) / max_rate)
+                async for limited_chunk in self._yield_limited_chunks(chunk, max_rate):
+                    yield limited_chunk
 
-        # レスポンスの属性をチェックして安全に処理
-        if hasattr(response, "body") and response.body:
-            response.body = b"".join([chunk async for chunk in limited_iterator([response.body])])
-        elif hasattr(response, "body_iterator"):
-            # StreamingResponseの場合
-            original_iterator = response.body_iterator
-            response.body_iterator = limited_iterator(original_iterator)
-        elif hasattr(response, "streaming"):
+        # レスポンス本文を追加で連結せず、常にストリーミングで制限する
+        if hasattr(response, "body_iterator"):
+            return self._build_streaming_response(response, limited_iterator(response.body_iterator))
+
+        if hasattr(response, "body") and response.body is not None:
+            return self._build_streaming_response(response, limited_iterator(self._iterate_in_chunks(response.body)))
+
+        if hasattr(response, "streaming"):
             response.streaming = limited_iterator(response.streaming)
 
         return response

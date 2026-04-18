@@ -139,7 +139,7 @@ def test_fastapi_route_resolution():
     middleware = ResponseBandwidthLimiterMiddleware(app)
     
     # モックリクエストを作成
-    mock_request = Request(scope={"type": "http", "app": app, "path": "/not-exist"})
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/not-exist", "method": "GET"})
     
     # 実装ロジックのテスト - 新しい引数で呼び出し
     assert middleware.get_handler_name(mock_request, "/not-exist") is None
@@ -149,10 +149,61 @@ def test_fastapi_route_resolution():
         return {"hello": "world"}
     
     # カスタム名でルートを見つけられるか
-    mock_request = Request(scope={"type": "http", "app": app, "path": "/test"})
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/test", "method": "GET"})
     assert middleware.get_handler_name(mock_request, "/test") == "custom_name"
     
     # 関数名でルートを見つけられるか
     app.state.response_bandwidth_limits = {"read_test": 200}
     middleware = ResponseBandwidthLimiterMiddleware(app)
     assert middleware.get_handler_name(mock_request, "/test") == "read_test"
+
+# FastAPIの動的ルート解決テスト
+def test_fastapi_dynamic_route_resolution():
+    app = FastAPI()
+    app.state.response_bandwidth_limits = {"read_item": 100}
+
+    @app.get("/items/{item_id}")
+    async def read_item(item_id: str):
+        return {"item_id": item_id}
+
+    middleware = ResponseBandwidthLimiterMiddleware(app)
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/items/123", "method": "GET"})
+    assert middleware.get_handler_name(mock_request, "/items/123") == "read_item"
+
+# 非ストリーミングレスポンスのヘッダ保持テスト
+def test_plain_response_headers_are_preserved():
+    app = FastAPI()
+    app.state.response_bandwidth_limits = {"read_test": 200}
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    @app.get("/test")
+    async def read_test():
+        response = PlainTextResponse("payload", headers={"X-Test": "ok"})
+        response.set_cookie("session", "value")
+        return response
+
+    client = TestClient(app)
+    response = client.get("/test")
+
+    assert response.status_code == 200
+    assert response.headers["X-Test"] == "ok"
+    assert response.cookies.get("session") == "value"
+
+def test_small_plain_response_is_delayed_before_first_chunk():
+    app = FastAPI()
+    app.state.response_bandwidth_limits = {"slow_response": 10}
+    app.add_middleware(ResponseBandwidthLimiterMiddleware)
+
+    @app.get("/slow")
+    async def slow_response():
+        return PlainTextResponse("x" * 20)
+
+    client = TestClient(app)
+
+    start_time = time.time()
+    response = client.get("/slow")
+    elapsed = time.time() - start_time
+
+    assert response.status_code == 200
+    assert response.text == "x" * 20
+    assert elapsed >= 1.5, f"小さいレスポンスでも帯域制限前に即時送信されています: {elapsed:.2f}秒"
