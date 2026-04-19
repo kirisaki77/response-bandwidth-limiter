@@ -125,11 +125,11 @@ import os
 from fastapi import FastAPI, Request
 from starlette.responses import PlainTextResponse
 
-from response_bandwidth_limiter import RedisBackend, Reject, ResponseBandwidthLimiter, Rule
+from response_bandwidth_limiter import RedisStorage, Reject, ResponseBandwidthLimiter, Rule
 
 app = FastAPI()
 limiter = ResponseBandwidthLimiter(
-    counter_backend=RedisBackend.from_url(os.environ["REDIS_URL"], failure_mode="open"),
+    storage=RedisStorage.from_url(os.environ["REDIS_URL"], counter_failure_mode="open", control_failure_mode="closed"),
     trusted_proxy_headers=True,
 )
 
@@ -141,7 +141,7 @@ async def shared_policy(request: Request):
 limiter.init_app(app)
 ```
 
-`RedisBackend` を使うと request count policy のカウンタを Redis に保存できるため、複数ワーカー、複数スレッド、複数サーバー間で同じ sliding-window カウンタを共有できます。Redis サーバーは 5.0 以上が必要です。
+`RedisStorage` を使うと request count policy のカウンタを Redis に保存できるため、複数ワーカー、複数スレッド、複数サーバー間で同じ sliding-window カウンタを共有できます。Redis サーバーは 5.0 以上が必要です。IP block / allow の control data は既定で fail-closed になり、request counter 用の failure policy とは分離されています。
 
 ## 実行時の設定更新
 
@@ -182,14 +182,16 @@ async def set_policy(endpoint: str, mode: str):
 
 上記の `/admin` エンドポイントは説明用の最小サンプルです。本番環境では通常の認証・認可を必ず追加してください。
 
-実行可能なサンプルは [example/main.py](example/main.py)、[example/dynamic_limit_example.py](example/dynamic_limit_example.py)、[example/redis_shared_policy_example.py](example/redis_shared_policy_example.py) を参照してください。
+実行可能なサンプルは [example/main.py](example/main.py)、[example/dynamic_limit_example.py](example/dynamic_limit_example.py)、[example/redis_shared_policy_example.py](example/redis_shared_policy_example.py)、[example/ip_limiting_example.py](example/ip_limiting_example.py) を参照してください。
 
 ## 制限事項と注意点
 
 - 帯域制限はサーバーサイドで適用されるため、実際の転送速度はネットワーク状況にも依存します。
-- request count policy は既定では `InMemoryBackend` に保存されるため、`RedisBackend` を明示しない限り分散構成でプロセス間・サーバー間共有されません。
-- `RedisBackend` を使う場合、Redis サーバーは 5.0 以上が必要です。
-- `update_policy()` と `update_route()` の実行時更新は、RedisBackend 利用時でも引き続きプロセスローカルです。
+- request count policy と IP block / allow は既定では `InMemoryStorage` に保存されるため、分散構成でプロセス間・サーバー間共有されません。
+- `ManagerStorage` は experimental です。低速で、一貫性は保証されず、高負荷環境には不向きです。
+- `RedisStorage` を使う場合、Redis サーバーは 5.0 以上が必要です。
+- `update_policy()` と `update_route()` の実行時更新は、RedisStorage 利用時でも引き続きプロセスローカルです。
+- `key_func` は request count policy の識別子だけを上書きします。IP block / allow は常に実 IP を使います。
 - `X-Forwarded-For` を識別に使う場合は、信頼できるリバースプロキシの背後でのみその値を信用してください。
 - 不正な proxy header 値は無視され、middleware は直接接続元のアドレスへフォールバックします。
 
@@ -199,12 +201,19 @@ async def set_policy(endpoint: str, mode: str):
 
 ```python
 class ResponseBandwidthLimiter:
-    def __init__(self, key_func=None, trusted_proxy_headers: bool = False, counter_backend: CounterBackend | None = None): ...
+    def __init__(self, key_func=None, trusted_proxy_headers: bool = False, storage: Storage | None = None): ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
     def init_app(self, app, install_signal_handlers: bool = True): ...
     def begin_shutdown(self, mode: ShutdownMode): ...
     async def shutdown(self, mode: ShutdownMode, timeout: float | None = None) -> bool: ...
+    async def close(self) -> None: ...
+    async def block_ip(self, ip: str, duration: int | None = None) -> None: ...
+    async def unblock_ip(self, ip: str) -> None: ...
+    async def is_blocked(self, ip: str) -> bool: ...
+    async def allow_ip(self, ip: str) -> None: ...
+    async def remove_allow(self, ip: str) -> None: ...
+    async def is_allowed(self, ip: str) -> bool: ...
     def update_route(self, endpoint_name: str, rate: int): ...
     def remove_route(self, endpoint_name: str): ...
     def update_policy(self, endpoint_name: str, rules: list[Rule]): ...
@@ -213,6 +222,10 @@ class ResponseBandwidthLimiter:
     def get_rules(self, endpoint_name: str) -> list[Rule]: ...
     @property
     def shutdown_coordinator(self) -> ShutdownCoordinator: ...
+    @property
+    def storage(self) -> Storage: ...
+    @property
+    def ip_manager(self) -> IPManager: ...
     @property
     def routes(self) -> Mapping[str, int]: ...
     @property
@@ -223,26 +236,30 @@ class ResponseBandwidthLimiter:
 
 `key_func` を指定すると、request count policy で使うクライアント識別子を独自に決められます。
 `trusted_proxy_headers` の既定値は `False` です。`X-Forwarded-For` や `X-Real-IP` を信頼できるリバースプロキシ配下でのみ `True` にしてください。
-`counter_backend` には request count policy のカウンタ保存先を指定します。省略時は `InMemoryBackend` が使われます。
+`storage` には request count policy と IP block / allow の保存先を指定します。省略時は `InMemoryStorage` が使われます。
 デコレータは limiter の設定だけを登録し、エンドポイントの元のシグネチャは保持されます。
 
 - `routes` は現在設定されている帯域制限を返します。
 - `policies` は現在設定されている request count rule を返します。
 - `configured_names` は route と policy の両方で設定済みの名前集合を返します。
+- `storage` は limiter が使用している `Storage` インスタンスを返します。
+- `ip_manager` は limiter が使用している `IPManager` インスタンスを返します。
 
-### `CounterBackend`, `InMemoryBackend`, `RedisBackend`
+### `Storage`, `InMemoryStorage`, `ManagerStorage`, `RedisStorage`
 
 ```python
-class CounterBackend: ...
-class InMemoryBackend(CounterBackend): ...
-class RedisBackend(CounterBackend): ...
+class Storage: ...
+class InMemoryStorage(Storage): ...
+class ManagerStorage(Storage): ...
+class RedisStorage(Storage): ...
 ```
 
-- `InMemoryBackend` は従来どおりのプロセスローカルな sliding window を提供します。
-- `RedisBackend.from_url("redis://...")` を使うと、request count をワーカー間・サーバー間で共有できます。
-- `RedisBackend` は `failure_mode="open"`、`"closed"`、`"local-memory-fallback"` をサポートします。
-- `key_hash=True` を指定すると、Redis キーが長くなりすぎる場合に request_key 部分だけをハッシュ化できます。
-- `RedisBackend` は Redis サーバー 5.0 以上が必要です。
+- `InMemoryStorage` はプロセスローカルで exact sliding window を提供します。
+- `ManagerStorage` は `multiprocessing.Manager` の共有 proxy を使う簡易共有実装です。experimental で exact sliding window は保証しません。
+- `RedisStorage.from_url("redis://...")` を使うと、request count をワーカー間・サーバー間で共有できます。
+- `RedisStorage` は `counter_failure_mode="open" | "closed" | "local-memory-fallback"` と `control_failure_mode="closed" | "local-memory-fallback"` をサポートします。
+- `key_hash=True` を指定すると、Redis の request key 部分だけをハッシュ化できます。
+- `RedisStorage` は Redis サーバー 5.0 以上が必要です。
 
 ### `Rule`, `Reject`, `Delay`, `Throttle`
 

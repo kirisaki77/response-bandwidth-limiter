@@ -10,10 +10,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .backend import CounterBackendUnavailableError
+from .ip_manager import IPManager
 from .models import PolicyDecision, Rule
 from .policy import MatchedPolicy, PolicyEvaluator
 from .shutdown import ShutdownCoordinator, ShutdownMode
+from .storage import StorageUnavailableError
 from .streaming import ResponseStreamer, StreamingAbortedError
 
 class ResponseBandwidthLimiterMiddleware:
@@ -23,6 +24,7 @@ class ResponseBandwidthLimiterMiddleware:
         self,
         app: ASGIApp,
         policy_evaluator: Optional[PolicyEvaluator] = None,
+        ip_manager: Optional[IPManager] = None,
         response_streamer: Optional[ResponseStreamer] = None,
         shutdown_coordinator: Optional[ShutdownCoordinator] = None,
         install_signal_handlers: bool = True,
@@ -35,6 +37,7 @@ class ResponseBandwidthLimiterMiddleware:
         """
         self.app = app
         self.policy_evaluator = policy_evaluator or PolicyEvaluator()
+        self.ip_manager = ip_manager
         self.response_streamer = response_streamer or ResponseStreamer(chunk_size=self.chunk_size, sleep_func=asyncio.sleep)
         self.shutdown_coordinator = shutdown_coordinator or ShutdownCoordinator()
         self.install_signal_handlers = install_signal_handlers
@@ -160,7 +163,7 @@ class ResponseBandwidthLimiterMiddleware:
 
         return None
 
-    def _get_request_key(
+    def _get_client_identifier(
         self,
         request: Request,
         key_func: Optional[Callable[[Request], Any]],
@@ -191,6 +194,26 @@ class ResponseBandwidthLimiterMiddleware:
 
         return "unknown"
 
+    def _get_client_ip(self, request: Request, trust_proxy_headers: bool = False) -> str | None:
+        if trust_proxy_headers:
+            forwarded_ip = self._extract_valid_ip(request.headers.get("x-forwarded-for"))
+            if forwarded_ip is not None:
+                return forwarded_ip
+
+            real_ip = self._extract_valid_ip(request.headers.get("x-real-ip"))
+            if real_ip is not None:
+                return real_ip
+
+        client = getattr(request, "client", None)
+        if client and getattr(client, "host", None):
+            return self._extract_valid_ip(str(client.host))
+
+        scope_client = request.scope.get("client")
+        if scope_client:
+            return self._extract_valid_ip(str(scope_client[0]))
+
+        return None
+
     def _get_limiter(self, app: Any) -> Any:
         app_state = getattr(app, "state", None)
         if app_state is None:
@@ -199,14 +222,11 @@ class ResponseBandwidthLimiterMiddleware:
 
     async def _evaluate_policy_rules(
         self,
-        request: Request,
         handler_name: str,
         rules: list[Rule],
-        key_func: Any,
-        trust_proxy_headers: bool,
+        request_identifier: str,
     ) -> Optional[MatchedPolicy]:
-        request_key = self._get_request_key(request, key_func, trust_proxy_headers)
-        return await self.policy_evaluator.evaluate(request_key, handler_name, rules)
+        return await self.policy_evaluator.evaluate(request_identifier, handler_name, rules)
 
     def _build_reject_response(self, decision: PolicyDecision) -> JSONResponse:
         headers = {"Retry-After": str(decision.retry_after)}
@@ -237,13 +257,14 @@ class ResponseBandwidthLimiterMiddleware:
             },
         )
 
-    def _collect_active_rules(self, limiter: Any) -> dict[str, list[Rule]]:
-        active_rules: dict[str, list[Rule]] = {}
-        for name in limiter.configured_names:
-            rules = limiter.get_rules(name)
-            if rules:
-                active_rules[name] = rules
-        return active_rules
+    def _build_blocked_ip_response(self) -> JSONResponse:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "IP blocked",
+                "detail": "The client IP is blocked.",
+            },
+        )
 
     def get_handler_name(self, request: Request, path: str) -> Optional[str]:
         """
@@ -295,20 +316,25 @@ class ResponseBandwidthLimiterMiddleware:
         await send({"type": "http.response.body", "body": pending_chunk, "more_body": more_body})
 
     async def _handle_lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if not self.install_signal_handlers:
-            await self.app(scope, receive, send)
-            return
-
         async def receive_with_signal() -> Message:
             message = await receive()
-            if message["type"] == "lifespan.startup":
+            if self.install_signal_handlers and message["type"] == "lifespan.startup":
                 self._install_signal_handler()
             return message
 
         try:
             await self.app(scope, receive_with_signal, send)
         finally:
-            self._restore_signal_handler()
+            if self.install_signal_handlers:
+                self._restore_signal_handler()
+
+            limiter = self._get_limiter(scope.get("app", self.app))
+            if limiter is not None and hasattr(limiter, "close"):
+                await limiter.close()
+            else:
+                evaluator_storage = getattr(self.policy_evaluator, "storage", None)
+                if evaluator_storage is not None and callable(getattr(evaluator_storage, "close", None)):
+                    await evaluator_storage.close()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -326,6 +352,22 @@ class ResponseBandwidthLimiterMiddleware:
             await self.app(scope, receive, send)
             return
 
+        ip_manager = self.ip_manager or getattr(limiter, "ip_manager", None)
+        client_ip = self._get_client_ip(request, getattr(limiter, "trusted_proxy_headers", False))
+        if ip_manager is not None and client_ip is not None:
+            try:
+                if await ip_manager.is_blocked(client_ip):
+                    response = self._build_blocked_ip_response()
+                    await response(scope, receive, send)
+                    return
+                ip_allowed = await ip_manager.is_allowed(client_ip)
+            except StorageUnavailableError:
+                response = self._build_backend_unavailable_response()
+                await response(scope, receive, send)
+                return
+        else:
+            ip_allowed = False
+
         path = scope["path"]
         handler_name = self.get_handler_name(request, path)
 
@@ -334,32 +376,22 @@ class ResponseBandwidthLimiterMiddleware:
             return
 
         route_limit = limiter.get_limit(handler_name)
-        route_rules = limiter.get_rules(handler_name)
-        if self.shutdown_coordinator.is_shutting_down and (route_limit is not None or route_rules):
+        rules = limiter.get_rules(handler_name)
+        if self.shutdown_coordinator.is_shutting_down and (route_limit is not None or rules):
             response = self._build_shutdown_response()
             await response(scope, receive, send)
             return
 
-        active_rules = self._collect_active_rules(limiter)
-        try:
-            await self.policy_evaluator.cleanup_expired(active_rules)
-        except CounterBackendUnavailableError:
-            response = self._build_backend_unavailable_response()
-            await response(scope, receive, send)
-            return
-
         decision = None
-        rules = active_rules.get(handler_name, [])
         if rules:
+            request_identifier = self._get_client_identifier(
+                request,
+                limiter.key_func,
+                getattr(limiter, "trusted_proxy_headers", False),
+            )
             try:
-                matched_rule = await self._evaluate_policy_rules(
-                    request,
-                    handler_name,
-                    rules,
-                    limiter.key_func,
-                    getattr(limiter, "trusted_proxy_headers", False),
-                )
-            except CounterBackendUnavailableError:
+                matched_rule = None if ip_allowed else await self._evaluate_policy_rules(handler_name, rules, request_identifier)
+            except StorageUnavailableError:
                 response = self._build_backend_unavailable_response()
                 await response(scope, receive, send)
                 return

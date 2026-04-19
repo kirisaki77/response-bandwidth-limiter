@@ -4,8 +4,8 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse
-from response_bandwidth_limiter import ActionProtocol, CounterBackend, Delay, PolicyDecision, Reject, ResponseBandwidthLimiter, Rule, Throttle, get_endpoint_name, get_route_path
-from response_bandwidth_limiter.backend import HitResult
+from response_bandwidth_limiter import ActionProtocol, Delay, PolicyDecision, Reject, ResponseBandwidthLimiter, Rule, SlidingWindowResult, Storage, Throttle, get_endpoint_name, get_route_path
+from response_bandwidth_limiter.storage import InMemoryStorage
 from response_bandwidth_limiter.policy import PolicyEvaluator
 
 # デコレータAPIのテスト
@@ -90,6 +90,24 @@ def test_update_route_and_policy_manage_runtime_configuration():
 
     assert limiter.get_limit("download") is None
     assert limiter.get_rules("download") == []
+
+
+def test_configured_names_returns_union_of_routes_and_policies():
+    limiter = ResponseBandwidthLimiter()
+    limiter.update_route("download", 128)
+    limiter.update_policy("upload", [Rule(count=1, per="second", action=Reject())])
+
+    assert limiter.configured_names == {"download", "upload"}
+
+    limiter.update_policy("download", [Rule(count=1, per="second", action=Reject())])
+    assert limiter.configured_names == {"download", "upload"}
+
+
+def test_update_route_rejects_empty_endpoint_name():
+    limiter = ResponseBandwidthLimiter()
+
+    with pytest.raises(ValueError):
+        limiter.update_route("", 128)
 
 
 def test_invalid_limit_rules_argument():
@@ -289,26 +307,28 @@ def test_response_streamer_rejects_invalid_chunk_size():
 @pytest.mark.asyncio
 async def test_policy_evaluator_cleanup_expired_removes_stale_counters():
     now = [0.0]
-    evaluator = PolicyEvaluator(time_provider=lambda: now[0])
+    storage = InMemoryStorage(time_provider=lambda: now[0])
+    evaluator = PolicyEvaluator(storage=storage)
     rule = Rule(count=1, per="second", action=Reject())
 
     await evaluator.evaluate("client-a", "download", [rule])
     assert len(evaluator.request_counters) == 1
 
     now[0] = 10.0
-    await evaluator.cleanup_expired({"download": [rule]})
+    storage.cleanup_orphaned_counters({"download": [rule]})
     assert len(evaluator.request_counters) == 0
 
 
 @pytest.mark.asyncio
 async def test_policy_evaluator_cleanup_expired_removes_orphaned_counters():
-    evaluator = PolicyEvaluator(time_provider=lambda: 1.0)
+    storage = InMemoryStorage(time_provider=lambda: 1.0)
+    evaluator = PolicyEvaluator(storage=storage)
     rule = Rule(count=1, per="second", action=Reject())
 
     await evaluator.evaluate("client-a", "download", [rule])
     assert len(evaluator.request_counters) == 1
 
-    await evaluator.cleanup_expired({})
+    storage.cleanup_orphaned_counters({})
     assert len(evaluator.request_counters) == 0
 
 
@@ -330,21 +350,48 @@ async def test_policy_evaluator_selects_highest_priority_action():
 
 
 @pytest.mark.asyncio
-async def test_policy_evaluator_uses_custom_counter_backend():
-    class StubBackend(CounterBackend):
+async def test_policy_evaluator_uses_custom_storage():
+    class StubStorage(Storage):
         def __init__(self):
             self.calls = []
 
+        async def get(self, key: str):
+            return None
+
+        async def set(self, key: str, value, expire=None):
+            return None
+
+        async def incr(self, key: str, expire=None):
+            return 0
+
+        async def delete(self, key: str):
+            return None
+
         async def record_hit(self, request_key, handler_name, rule_index, window_seconds):
             self.calls.append((request_key, handler_name, rule_index, window_seconds))
-            return HitResult(hit_count=2, oldest_timestamp=1.0, current_timestamp=1.1)
+            return SlidingWindowResult(hit_count=2, oldest_timestamp=1.0, current_timestamp=1.1)
 
-    backend = StubBackend()
-    evaluator = PolicyEvaluator(backend=backend)
+    storage = StubStorage()
+    evaluator = PolicyEvaluator(storage=storage)
     rule = Rule(count=1, per="second", action=Reject())
 
     result = await evaluator.evaluate("client-a", "download", [rule])
 
     assert result is not None
     assert isinstance(result.rule.action, Reject)
-    assert backend.calls == [("client-a", "download", 0, 1)]
+    assert storage.calls == [("client-a", "download", 0, 1)]
+
+
+@pytest.mark.asyncio
+async def test_limiter_remove_policy_cleans_in_memory_request_counters():
+    storage = InMemoryStorage(time_provider=lambda: 1.0)
+    limiter = ResponseBandwidthLimiter(storage=storage)
+    rule = Rule(count=1, per="second", action=Reject())
+    limiter.update_policy("download", [rule])
+
+    await limiter._policy_evaluator.evaluate("client-a", "download", [rule])
+    assert len(limiter._policy_evaluator.request_counters) == 1
+
+    limiter.remove_policy("download")
+
+    assert len(limiter._policy_evaluator.request_counters) == 0
