@@ -125,11 +125,11 @@ import os
 from fastapi import FastAPI, Request
 from starlette.responses import PlainTextResponse
 
-from response_bandwidth_limiter import RedisBackend, Reject, ResponseBandwidthLimiter, Rule
+from response_bandwidth_limiter import RedisStorage, Reject, ResponseBandwidthLimiter, Rule
 
 app = FastAPI()
 limiter = ResponseBandwidthLimiter(
-    counter_backend=RedisBackend.from_url(os.environ["REDIS_URL"], failure_mode="open"),
+    storage=RedisStorage.from_url(os.environ["REDIS_URL"], counter_failure_mode="open", control_failure_mode="closed"),
     trusted_proxy_headers=True,
 )
 
@@ -141,7 +141,7 @@ async def shared_policy(request: Request):
 limiter.init_app(app)
 ```
 
-`RedisBackend` keeps request-count policy counters in Redis, so those counters can be shared across multiple workers, threads, or servers. The backend uses the same sliding-window semantics as the default in-memory evaluator. Redis server 5.0 or later is required.
+`RedisStorage` keeps request-count policy counters in Redis, so those counters can be shared across multiple workers, threads, or servers. The storage uses the same sliding-window semantics as the default in-memory evaluator. Redis server 5.0 or later is required. IP block / allow control data uses a separate failure policy and does not fail open by default.
 
 ## Runtime Updates
 
@@ -182,14 +182,16 @@ async def set_policy(endpoint: str, mode: str):
 
 The admin endpoints above are intentionally minimal examples. Protect similar endpoints with your application's normal authentication and authorization.
 
-For runnable examples, see [example/main.py](example/main.py), [example/dynamic_limit_example.py](example/dynamic_limit_example.py), and [example/redis_shared_policy_example.py](example/redis_shared_policy_example.py).
+For runnable examples, see [example/main.py](example/main.py), [example/dynamic_limit_example.py](example/dynamic_limit_example.py), [example/redis_shared_policy_example.py](example/redis_shared_policy_example.py), and [example/ip_limiting_example.py](example/ip_limiting_example.py).
 
 ## Limitations and Considerations
 
 - Limits are applied server-side, so real transfer speed also depends on network conditions.
-- Request-count policies use `InMemoryBackend` by default, so counters are not shared across processes or servers unless you configure `RedisBackend`.
-- `RedisBackend` requires Redis server 5.0 or later.
+- Request-count policies and IP block / allow use `InMemoryStorage` by default, so state is not shared across processes or servers.
+- `ManagerStorage` is experimental, slow, and not suitable for high-load environments. It does not guarantee consistency or exact sliding-window behavior.
+- `RedisStorage` requires Redis server 5.0 or later.
 - `update_policy()` and `update_route()` remain process-local runtime changes even when request counters are shared through Redis.
+- `key_func` only overrides the identifier used by request-count policies. IP block / allow always uses the real client IP.
 - If request identity comes from `X-Forwarded-For`, only trust that header behind a trusted reverse proxy that rewrites or sanitizes it.
 - Malformed proxy header values are ignored and the middleware falls back to the direct client address.
 
@@ -199,12 +201,19 @@ For runnable examples, see [example/main.py](example/main.py), [example/dynamic_
 
 ```python
 class ResponseBandwidthLimiter:
-    def __init__(self, key_func=None, trusted_proxy_headers: bool = False, counter_backend: CounterBackend | None = None): ...
+    def __init__(self, key_func=None, trusted_proxy_headers: bool = False, storage: Storage | None = None): ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
     def init_app(self, app, install_signal_handlers: bool = True): ...
     def begin_shutdown(self, mode: ShutdownMode): ...
     async def shutdown(self, mode: ShutdownMode, timeout: float | None = None) -> bool: ...
+    async def close(self) -> None: ...
+    async def block_ip(self, ip: str, duration: int | None = None) -> None: ...
+    async def unblock_ip(self, ip: str) -> None: ...
+    async def is_blocked(self, ip: str) -> bool: ...
+    async def allow_ip(self, ip: str) -> None: ...
+    async def remove_allow(self, ip: str) -> None: ...
+    async def is_allowed(self, ip: str) -> bool: ...
     def update_route(self, endpoint_name: str, rate: int): ...
     def remove_route(self, endpoint_name: str): ...
     def update_policy(self, endpoint_name: str, rules: list[Rule]): ...
@@ -213,6 +222,10 @@ class ResponseBandwidthLimiter:
     def get_rules(self, endpoint_name: str) -> list[Rule]: ...
     @property
     def shutdown_coordinator(self) -> ShutdownCoordinator: ...
+    @property
+    def storage(self) -> Storage: ...
+    @property
+    def ip_manager(self) -> IPManager: ...
     @property
     def routes(self) -> Mapping[str, int]: ...
     @property
@@ -223,26 +236,30 @@ class ResponseBandwidthLimiter:
 
 `key_func` lets you override the client identifier used by request-count policies.
 `trusted_proxy_headers` is `False` by default. Enable it only behind a trusted reverse proxy that rewrites `X-Forwarded-For` or `X-Real-IP`.
-`counter_backend` controls where request-count policy counters are stored. If omitted, `InMemoryBackend` is used.
+`storage` controls where request-count policy counters and IP control data are stored. If omitted, `InMemoryStorage` is used.
 The decorators only register limiter configuration and preserve the endpoint's original signature.
 
 - `routes` exposes the currently configured bandwidth limits.
 - `policies` exposes the currently configured request-count rules.
 - `configured_names` returns the union of names configured by routes and policies.
+- `storage` returns the `Storage` instance used by the limiter.
+- `ip_manager` returns the `IPManager` instance used by the limiter.
 
-### `CounterBackend`, `InMemoryBackend`, `RedisBackend`
+### `Storage`, `InMemoryStorage`, `ManagerStorage`, `RedisStorage`
 
 ```python
-class CounterBackend: ...
-class InMemoryBackend(CounterBackend): ...
-class RedisBackend(CounterBackend): ...
+class Storage: ...
+class InMemoryStorage(Storage): ...
+class ManagerStorage(Storage): ...
+class RedisStorage(Storage): ...
 ```
 
-- `InMemoryBackend` keeps the existing process-local sliding-window behavior.
-- `RedisBackend.from_url("redis://...")` creates a Redis-backed counter store that shares request counts across workers and servers.
-- `RedisBackend` supports `failure_mode="open"`, `"closed"`, and `"local-memory-fallback"`.
+- `InMemoryStorage` keeps exact sliding-window behavior but is process-local.
+- `ManagerStorage` is an experimental `multiprocessing.Manager` based shared store. It does not guarantee exact sliding-window behavior.
+- `RedisStorage.from_url("redis://...")` creates a Redis-backed storage that shares request counts across workers and servers.
+- `RedisStorage` supports `counter_failure_mode="open" | "closed" | "local-memory-fallback"` and `control_failure_mode="closed" | "local-memory-fallback"`.
 - `key_hash=True` hashes only the request-key tail of the Redis key when the raw request identifier would make keys too long.
-- `RedisBackend` requires Redis server 5.0 or later.
+- `RedisStorage` requires Redis server 5.0 or later.
 
 ### `Rule`, `Reject`, `Delay`, `Throttle`
 

@@ -6,13 +6,13 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from fastapi import FastAPI, Request
 from starlette.responses import PlainTextResponse
 
-from response_bandwidth_limiter import RedisBackend, Reject, ResponseBandwidthLimiter, Rule
+from response_bandwidth_limiter import RedisStorage, Reject, ResponseBandwidthLimiter, Rule
 
 app = FastAPI()
 
 redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 limiter = ResponseBandwidthLimiter(
-    counter_backend=RedisBackend.from_url(redis_url, failure_mode="open"),
+    storage=RedisStorage.from_url(redis_url, counter_failure_mode="open", control_failure_mode="closed"),
     trusted_proxy_headers=True,
 )
 

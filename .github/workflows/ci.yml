@@ -86,7 +86,7 @@ jobs:
         run: python -m pip install -r requirements/dev.txt -e ".[dev]"
 
       - name: Run shared-counter integration test
-        run: python -m pytest -q tests/test_redis_backend.py::test_redis_backend_shares_counters_across_evaluators
+        run: python -m pytest -q tests/test_redis_storage.py::test_redis_storage_shares_counters_across_evaluators
 
   build:
     name: Build verification (Python 3.14)
