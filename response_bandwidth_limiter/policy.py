@@ -1,9 +1,8 @@
 import math
-from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
-from .backend import CounterBackend, InMemoryBackend
+from .storage import InMemoryStorage, SlidingWindowResult, Storage
 from .models import Rule
 
 
@@ -27,21 +26,21 @@ class _CandidateAction:
 class PolicyEvaluator:
     def __init__(
         self,
-        backend: CounterBackend | None = None,
+        storage: Storage | None = None,
         time_provider: Callable[[], float] | None = None,
         max_counters: int = 10000,
     ):
-        if backend is not None and not isinstance(backend, CounterBackend):
-            raise TypeError("backend は CounterBackend を実装している必要があります。")
-        self._backend = backend or InMemoryBackend(time_provider=time_provider, max_counters=max_counters)
+        if storage is not None and not isinstance(storage, Storage):
+            raise TypeError("storage は Storage を実装している必要があります。")
+        self._storage = storage or InMemoryStorage(time_provider=time_provider, max_counters=max_counters)
 
     @property
-    def backend(self) -> CounterBackend:
-        return self._backend
+    def storage(self) -> Storage:
+        return self._storage
 
     @property
     def request_counters(self) -> Dict[Tuple[str, str, int], Deque[float]]:
-        counters = getattr(self._backend, "request_counters", None)
+        counters = getattr(self._storage, "request_counters", None)
         if counters is None:
             return {}
         return dict(counters)
@@ -50,7 +49,7 @@ class PolicyEvaluator:
         matched_actions: List[_CandidateAction] = []
 
         for index, rule in enumerate(rules):
-            hit_result = await self._backend.record_hit(request_key, handler_name, index, rule.window_seconds)
+            hit_result = await self._storage.record_hit(request_key, handler_name, index, rule.window_seconds)
             if hit_result.hit_count > rule.count:
                 retry_after = self._retry_after_seconds(
                     hit_result.oldest_timestamp,
@@ -65,9 +64,6 @@ class PolicyEvaluator:
 
         rule, retry_after = selected
         return MatchedPolicy(rule=rule, retry_after=retry_after)
-
-    async def cleanup_expired(self, active_rules: Dict[str, List[Rule]]) -> None:
-        await self._backend.cleanup_expired(active_rules)
 
     def _select_rule_action(self, matched_actions: List[_CandidateAction]) -> Optional[Tuple[Rule, int]]:
         if not matched_actions:
