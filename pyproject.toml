@@ -17,8 +17,9 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 
-# 必須の依存関係（標準ライブラリは含めない）
-dependencies = []
+dependencies = [
+    "starlette>=0.20.0",
+]
 
 [project.optional-dependencies]
 redis = [

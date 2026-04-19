@@ -6,8 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse, StreamingResponse
 
-from response_bandwidth_limiter import CounterBackend, Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule, Throttle
-from response_bandwidth_limiter.backend import CounterBackendUnavailableError, HitResult
+from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule, SlidingWindowResult, Storage, StorageUnavailableError, Throttle
 
 
 def test_fastapi_middleware(recorded_limit_calls):
@@ -293,7 +292,7 @@ def test_policy_falls_back_to_proxy_ip_when_key_func_raises():
     assert client.get("/fallback-key", headers={"X-Forwarded-For": "203.0.113.11"}).status_code == 200
 
 
-def test_get_request_key_prefers_real_ip_and_falls_back_to_scope_client():
+def test_get_client_identifier_prefers_real_ip_and_falls_back_to_scope_client():
     middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
 
     real_ip_request = Request(scope={
@@ -316,12 +315,12 @@ def test_get_request_key_prefers_real_ip_and_falls_back_to_scope_client():
         "headers": [],
     })
 
-    assert middleware._get_request_key(real_ip_request, None, trust_proxy_headers=True) == "192.0.2.10"
-    assert middleware._get_request_key(scope_client_request, None) == "198.51.100.7"
-    assert middleware._get_request_key(unknown_request, None) == "unknown"
+    assert middleware._get_client_identifier(real_ip_request, None, trust_proxy_headers=True) == "192.0.2.10"
+    assert middleware._get_client_identifier(scope_client_request, None) == "198.51.100.7"
+    assert middleware._get_client_identifier(unknown_request, None) == "unknown"
 
 
-def test_get_request_key_ignores_invalid_proxy_header_values():
+def test_get_client_identifier_ignores_invalid_proxy_header_values():
     middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
     request = Request(scope={
         "type": "http",
@@ -331,10 +330,10 @@ def test_get_request_key_ignores_invalid_proxy_header_values():
         "client": ("198.51.100.7", 12345),
     })
 
-    assert middleware._get_request_key(request, None, trust_proxy_headers=True) == "203.0.113.5"
+    assert middleware._get_client_identifier(request, None, trust_proxy_headers=True) == "203.0.113.5"
 
 
-def test_get_request_key_accepts_ipv6_proxy_headers():
+def test_get_client_identifier_accepts_ipv6_proxy_headers():
     middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
     request = Request(scope={
         "type": "http",
@@ -344,10 +343,10 @@ def test_get_request_key_accepts_ipv6_proxy_headers():
         "client": ("198.51.100.7", 12345),
     })
 
-    assert middleware._get_request_key(request, None, trust_proxy_headers=True) == "2001:db8::10"
+    assert middleware._get_client_identifier(request, None, trust_proxy_headers=True) == "2001:db8::10"
 
 
-def test_get_request_key_ignores_proxy_headers_by_default():
+def test_get_client_identifier_ignores_proxy_headers_by_default():
     middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
     request = Request(scope={
         "type": "http",
@@ -357,7 +356,20 @@ def test_get_request_key_ignores_proxy_headers_by_default():
         "client": ("198.51.100.7", 12345),
     })
 
-    assert middleware._get_request_key(request, None) == "198.51.100.7"
+    assert middleware._get_client_identifier(request, None) == "198.51.100.7"
+
+
+def test_get_client_ip_ignores_key_func_and_uses_real_ip_sources():
+    middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
+    request = Request(scope={
+        "type": "http",
+        "path": "/",
+        "method": "GET",
+        "headers": [(b"x-forwarded-for", b"198.51.100.10")],
+        "client": ("203.0.113.10", 12345),
+    })
+
+    assert middleware._get_client_ip(request, trust_proxy_headers=True) == "198.51.100.10"
 
 
 def test_middleware_accepts_injected_dependencies():
@@ -371,19 +383,31 @@ def test_middleware_accepts_injected_dependencies():
     assert middleware.response_streamer is streamer
 
 
-def test_limiter_uses_injected_counter_backend_for_policy_evaluation():
+def test_limiter_uses_injected_storage_for_policy_evaluation():
     app = FastAPI()
 
-    class RecordingBackend(CounterBackend):
+    class RecordingStorage(Storage):
         def __init__(self):
             self.calls = []
 
+        async def get(self, key: str):
+            return None
+
+        async def set(self, key: str, value, expire=None):
+            return None
+
+        async def incr(self, key: str, expire=None):
+            return 0
+
+        async def delete(self, key: str):
+            return None
+
         async def record_hit(self, request_key, handler_name, rule_index, window_seconds):
             self.calls.append((request_key, handler_name, rule_index, window_seconds))
-            return HitResult(hit_count=1, oldest_timestamp=1.0, current_timestamp=1.0)
+            return SlidingWindowResult(hit_count=1, oldest_timestamp=1.0, current_timestamp=1.0)
 
-    backend = RecordingBackend()
-    limiter = ResponseBandwidthLimiter(counter_backend=backend, key_func=lambda request: "client-1")
+    storage = RecordingStorage()
+    limiter = ResponseBandwidthLimiter(storage=storage, key_func=lambda request: "client-1")
     limiter.init_app(app)
 
     @app.get("/custom-backend")
@@ -394,17 +418,29 @@ def test_limiter_uses_injected_counter_backend_for_policy_evaluation():
     response = TestClient(app).get("/custom-backend")
 
     assert response.status_code == 200
-    assert backend.calls == [("client-1", "custom_backend", 0, 1)]
+    assert storage.calls == [("client-1", "custom_backend", 0, 1)]
 
 
-def test_fail_closed_counter_backend_returns_503():
+def test_fail_closed_storage_returns_503():
     app = FastAPI()
 
-    class FailingBackend(CounterBackend):
-        async def record_hit(self, request_key, handler_name, rule_index, window_seconds):
-            raise CounterBackendUnavailableError("redis down")
+    class FailingStorage(Storage):
+        async def get(self, key: str):
+            return None
 
-    limiter = ResponseBandwidthLimiter(counter_backend=FailingBackend())
+        async def set(self, key: str, value, expire=None):
+            return None
+
+        async def incr(self, key: str, expire=None):
+            return 0
+
+        async def delete(self, key: str):
+            return None
+
+        async def record_hit(self, request_key, handler_name, rule_index, window_seconds):
+            raise StorageUnavailableError("redis down")
+
+    limiter = ResponseBandwidthLimiter(storage=FailingStorage())
     limiter.init_app(app)
 
     @app.get("/backend-closed")
@@ -416,6 +452,55 @@ def test_fail_closed_counter_backend_returns_503():
 
     assert response.status_code == 503
     assert response.json()["error"] == "Rate limit backend unavailable"
+
+
+def test_blocked_ip_uses_real_ip_even_when_key_func_groups_requests():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(
+        key_func=lambda request: request.headers.get("X-Api-Key", "anonymous"),
+        trusted_proxy_headers=True,
+    )
+    limiter.init_app(app)
+
+    @app.get("/blocked")
+    async def blocked(request: Request):
+        return PlainTextResponse("ok")
+
+    async def prepare() -> None:
+        await limiter.block_ip("203.0.113.10")
+
+    asyncio.run(prepare())
+
+    response = TestClient(app).get(
+        "/blocked",
+        headers={"X-Api-Key": "alpha", "X-Forwarded-For": "203.0.113.10"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_allowed_ip_skips_request_count_policy_but_keeps_bandwidth_limit(recorded_limit_calls):
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.update_route("allowed", 10)
+    limiter.init_app(app)
+
+    @app.get("/allowed")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject())])
+    async def allowed(request: Request):
+        return PlainTextResponse("x" * 20)
+
+    async def prepare() -> None:
+        await limiter.allow_ip("203.0.113.50")
+
+    asyncio.run(prepare())
+    client = TestClient(app)
+
+    assert client.get("/allowed", headers={"X-Forwarded-For": "203.0.113.50"}).status_code == 200
+    second = client.get("/allowed", headers={"X-Forwarded-For": "203.0.113.50"})
+
+    assert second.status_code == 200
+    assert [call["rate"] for call in recorded_limit_calls] == [10, 10]
 
 
 def test_policy_applies_delay_before_handler_execution(recorded_sleep_calls):
@@ -580,3 +665,34 @@ def test_policy_throttle_skips_limiting_for_empty_body(recorded_limit_calls):
     assert response.status_code == 200
     assert response.content == b""
     assert recorded_limit_calls == []
+
+
+def test_storage_unavailable_on_ip_check_returns_503():
+    app = FastAPI()
+
+    class FailingIPStorage(Storage):
+        async def get(self, key: str):
+            if key.startswith("ip:"):
+                raise StorageUnavailableError("redis down")
+            return None
+
+        async def set(self, key: str, value, expire=None):
+            return None
+
+        async def incr(self, key: str, expire=None):
+            return 0
+
+        async def delete(self, key: str):
+            return None
+
+    limiter = ResponseBandwidthLimiter(storage=FailingIPStorage(), trusted_proxy_headers=True)
+    limiter.init_app(app)
+
+    @app.get("/ip-check")
+    async def ip_check(request: Request):
+        return PlainTextResponse("ok")
+
+    response = TestClient(app).get("/ip-check", headers={"X-Forwarded-For": "203.0.113.10"})
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "Rate limit backend unavailable"

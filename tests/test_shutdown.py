@@ -8,6 +8,7 @@ from starlette.responses import PlainTextResponse, StreamingResponse
 from response_bandwidth_limiter import ResponseBandwidthLimiter, ShutdownMode
 from response_bandwidth_limiter.middleware import ResponseBandwidthLimiterMiddleware
 from response_bandwidth_limiter.shutdown import ShutdownCoordinator
+from response_bandwidth_limiter.storage import InMemoryStorage
 from response_bandwidth_limiter.streaming import ResponseStreamer, StreamingAbortedError
 
 
@@ -258,3 +259,27 @@ def test_middleware_signal_handler_upgrades_shutdown_mode(monkeypatch):
     assert middleware.shutdown_coordinator.mode is ShutdownMode.ABORT
     assert len(original_calls) == 2
     assert signal.SIGINT in captured_handlers
+
+
+def test_lifespan_shutdown_closes_storage_once():
+    class ClosingStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    app = FastAPI()
+    storage = ClosingStorage()
+    limiter = ResponseBandwidthLimiter(storage=storage)
+    limiter.init_app(app, install_signal_handlers=False)
+
+    @app.get("/")
+    async def read_root():
+        return PlainTextResponse("ok")
+
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200
+
+    assert storage.close_calls == 1

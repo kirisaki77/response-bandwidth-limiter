@@ -1,13 +1,18 @@
+import logging
 import threading
 from typing import Callable, Dict, List, Mapping, Optional
 
 from starlette.applications import Starlette
 
-from .backend import CounterBackend
+from .ip_manager import IPManager
 from .middleware import ResponseBandwidthLimiterMiddleware
 from .models import Rule
 from .policy import PolicyEvaluator
 from .shutdown import ShutdownCoordinator, ShutdownMode
+from .storage import InMemoryStorage, Storage, warn_if_storage_requires_caution
+
+
+logger = logging.getLogger(__name__)
 
 class ResponseBandwidthLimiter:
     """
@@ -33,15 +38,18 @@ class ResponseBandwidthLimiter:
         self,
         key_func: Optional[Callable] = None,
         trusted_proxy_headers: bool = False,
-        counter_backend: Optional[CounterBackend] = None,
+        storage: Optional[Storage] = None,
     ):
         self._lock = threading.RLock()
         self._route_limits: Dict[str, int] = {}
         self._route_policies: Dict[str, List[Rule]] = {}
         self._shutdown_coordinator = ShutdownCoordinator()
-        self._policy_evaluator = PolicyEvaluator(backend=counter_backend)
+        self._storage = storage or InMemoryStorage()
+        self._policy_evaluator = PolicyEvaluator(storage=self._storage)
+        self._ip_manager = IPManager(storage=self._storage)
         self.key_func = key_func  # slowapi互換のため、キー関数を受け入れる
         self.trusted_proxy_headers = trusted_proxy_headers
+        self._storage_warning_emitted = False
 
     def _validate_endpoint_name(self, endpoint_name: str) -> None:
         if not isinstance(endpoint_name, str) or not endpoint_name:
@@ -84,6 +92,14 @@ class ResponseBandwidthLimiter:
     def shutdown_coordinator(self) -> ShutdownCoordinator:
         return self._shutdown_coordinator
 
+    @property
+    def storage(self) -> Storage:
+        return self._storage
+
+    @property
+    def ip_manager(self) -> IPManager:
+        return self._ip_manager
+
     def get_limit(self, endpoint_name: str) -> int | None:
         with self._lock:
             return self._route_limits.get(endpoint_name)
@@ -107,10 +123,16 @@ class ResponseBandwidthLimiter:
         self._validate_rules(rules)
         with self._lock:
             self._route_policies[endpoint_name] = list(rules)
+            active_rules = {name: list(configured_rules) for name, configured_rules in self._route_policies.items()}
+        self._storage.cleanup_handler_counters(endpoint_name)
+        self._storage.cleanup_orphaned_counters(active_rules)
 
     def remove_policy(self, endpoint_name: str) -> None:
         with self._lock:
             self._route_policies.pop(endpoint_name, None)
+            active_rules = {name: list(configured_rules) for name, configured_rules in self._route_policies.items()}
+        self._storage.cleanup_handler_counters(endpoint_name)
+        self._storage.cleanup_orphaned_counters(active_rules)
 
     def begin_shutdown(self, mode: ShutdownMode) -> None:
         self._shutdown_coordinator.begin_shutdown(mode)
@@ -118,6 +140,27 @@ class ResponseBandwidthLimiter:
     async def shutdown(self, mode: ShutdownMode, timeout: float | None = None) -> bool:
         self.begin_shutdown(mode)
         return await self._shutdown_coordinator.wait_until_drained(timeout=timeout)
+
+    async def close(self) -> None:
+        await self._storage.close()
+
+    async def block_ip(self, ip: str, duration: int | None = None) -> None:
+        await self._ip_manager.block_ip(ip, duration=duration)
+
+    async def unblock_ip(self, ip: str) -> None:
+        await self._ip_manager.unblock_ip(ip)
+
+    async def is_blocked(self, ip: str) -> bool:
+        return await self._ip_manager.is_blocked(ip)
+
+    async def allow_ip(self, ip: str) -> None:
+        await self._ip_manager.allow_ip(ip)
+
+    async def remove_allow(self, ip: str) -> None:
+        await self._ip_manager.remove_allow(ip)
+
+    async def is_allowed(self, ip: str) -> bool:
+        return await self._ip_manager.is_allowed(ip)
         
     def limit(self, rate: int) -> Callable:
         """
@@ -168,10 +211,15 @@ class ResponseBandwidthLimiter:
         Args:
             app: FastAPIまたはStarletteアプリケーション
         """
+        if not self._storage_warning_emitted:
+            warn_if_storage_requires_caution(self._storage)
+            self._storage_warning_emitted = True
+
         app.state.response_bandwidth_limiter = self
         app.add_middleware(
             ResponseBandwidthLimiterMiddleware,
             policy_evaluator=self._policy_evaluator,
+            ip_manager=self._ip_manager,
             shutdown_coordinator=self._shutdown_coordinator,
             install_signal_handlers=install_signal_handlers,
         )
