@@ -3,8 +3,10 @@ from typing import Callable, Dict, List, Mapping, Optional
 
 from starlette.applications import Starlette
 
+from .backend import CounterBackend
 from .middleware import ResponseBandwidthLimiterMiddleware
 from .models import Rule
+from .policy import PolicyEvaluator
 from .shutdown import ShutdownCoordinator, ShutdownMode
 
 class ResponseBandwidthLimiter:
@@ -27,11 +29,17 @@ class ResponseBandwidthLimiter:
         limiter.init_app(app)
         ```
     """
-    def __init__(self, key_func: Optional[Callable] = None, trusted_proxy_headers: bool = False):
+    def __init__(
+        self,
+        key_func: Optional[Callable] = None,
+        trusted_proxy_headers: bool = False,
+        counter_backend: Optional[CounterBackend] = None,
+    ):
         self._lock = threading.RLock()
         self._route_limits: Dict[str, int] = {}
         self._route_policies: Dict[str, List[Rule]] = {}
         self._shutdown_coordinator = ShutdownCoordinator()
+        self._policy_evaluator = PolicyEvaluator(backend=counter_backend)
         self.key_func = key_func  # slowapi互換のため、キー関数を受け入れる
         self.trusted_proxy_headers = trusted_proxy_headers
 
@@ -163,6 +171,7 @@ class ResponseBandwidthLimiter:
         app.state.response_bandwidth_limiter = self
         app.add_middleware(
             ResponseBandwidthLimiterMiddleware,
+            policy_evaluator=self._policy_evaluator,
             shutdown_coordinator=self._shutdown_coordinator,
             install_signal_handlers=install_signal_handlers,
         )
