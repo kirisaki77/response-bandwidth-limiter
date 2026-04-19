@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .backend import CounterBackendUnavailableError
 from .models import PolicyDecision, Rule
 from .policy import MatchedPolicy, PolicyEvaluator
 from .shutdown import ShutdownCoordinator, ShutdownMode
@@ -196,7 +197,7 @@ class ResponseBandwidthLimiterMiddleware:
             return None
         return getattr(app_state, "response_bandwidth_limiter", None)
 
-    def _evaluate_policy_rules(
+    async def _evaluate_policy_rules(
         self,
         request: Request,
         handler_name: str,
@@ -205,7 +206,7 @@ class ResponseBandwidthLimiterMiddleware:
         trust_proxy_headers: bool,
     ) -> Optional[MatchedPolicy]:
         request_key = self._get_request_key(request, key_func, trust_proxy_headers)
-        return self.policy_evaluator.evaluate(request_key, handler_name, rules)
+        return await self.policy_evaluator.evaluate(request_key, handler_name, rules)
 
     def _build_reject_response(self, decision: PolicyDecision) -> JSONResponse:
         headers = {"Retry-After": str(decision.retry_after)}
@@ -224,6 +225,15 @@ class ResponseBandwidthLimiterMiddleware:
             content={
                 "error": "Server shutting down",
                 "detail": "The server is shutting down and cannot accept throttled responses.",
+            },
+        )
+
+    def _build_backend_unavailable_response(self) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Rate limit backend unavailable",
+                "detail": "The request policy backend is unavailable and the limiter is configured to fail closed.",
             },
         )
 
@@ -331,18 +341,28 @@ class ResponseBandwidthLimiterMiddleware:
             return
 
         active_rules = self._collect_active_rules(limiter)
-        self.policy_evaluator.cleanup_expired(active_rules)
+        try:
+            await self.policy_evaluator.cleanup_expired(active_rules)
+        except CounterBackendUnavailableError:
+            response = self._build_backend_unavailable_response()
+            await response(scope, receive, send)
+            return
 
         decision = None
         rules = active_rules.get(handler_name, [])
         if rules:
-            matched_rule = self._evaluate_policy_rules(
-                request,
-                handler_name,
-                rules,
-                limiter.key_func,
-                getattr(limiter, "trusted_proxy_headers", False),
-            )
+            try:
+                matched_rule = await self._evaluate_policy_rules(
+                    request,
+                    handler_name,
+                    rules,
+                    limiter.key_func,
+                    getattr(limiter, "trusted_proxy_headers", False),
+                )
+            except CounterBackendUnavailableError:
+                response = self._build_backend_unavailable_response()
+                await response(scope, receive, send)
+                return
             if matched_rule is not None:
                 decision = matched_rule.rule.action.decide(matched_rule.retry_after)
                 if decision.reject:
