@@ -6,7 +6,8 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse, StreamingResponse
 
-from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule, Throttle
+from response_bandwidth_limiter import CounterBackend, Delay, Reject, ResponseBandwidthLimiter, ResponseBandwidthLimiterMiddleware, Rule, Throttle
+from response_bandwidth_limiter.backend import CounterBackendUnavailableError, HitResult
 
 
 def test_fastapi_middleware(recorded_limit_calls):
@@ -368,6 +369,53 @@ def test_middleware_accepts_injected_dependencies():
 
     assert middleware.policy_evaluator is evaluator
     assert middleware.response_streamer is streamer
+
+
+def test_limiter_uses_injected_counter_backend_for_policy_evaluation():
+    app = FastAPI()
+
+    class RecordingBackend(CounterBackend):
+        def __init__(self):
+            self.calls = []
+
+        async def record_hit(self, request_key, handler_name, rule_index, window_seconds):
+            self.calls.append((request_key, handler_name, rule_index, window_seconds))
+            return HitResult(hit_count=1, oldest_timestamp=1.0, current_timestamp=1.0)
+
+    backend = RecordingBackend()
+    limiter = ResponseBandwidthLimiter(counter_backend=backend, key_func=lambda request: "client-1")
+    limiter.init_app(app)
+
+    @app.get("/custom-backend")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject())])
+    async def custom_backend(request: Request):
+        return PlainTextResponse("ok")
+
+    response = TestClient(app).get("/custom-backend")
+
+    assert response.status_code == 200
+    assert backend.calls == [("client-1", "custom_backend", 0, 1)]
+
+
+def test_fail_closed_counter_backend_returns_503():
+    app = FastAPI()
+
+    class FailingBackend(CounterBackend):
+        async def record_hit(self, request_key, handler_name, rule_index, window_seconds):
+            raise CounterBackendUnavailableError("redis down")
+
+    limiter = ResponseBandwidthLimiter(counter_backend=FailingBackend())
+    limiter.init_app(app)
+
+    @app.get("/backend-closed")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject())])
+    async def backend_closed(request: Request):
+        return PlainTextResponse("ok")
+
+    response = TestClient(app).get("/backend-closed")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "Rate limit backend unavailable"
 
 
 def test_policy_applies_delay_before_handler_execution(recorded_sleep_calls):
