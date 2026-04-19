@@ -24,6 +24,12 @@ For development and tests:
 pip install response-bandwidth-limiter[dev]
 ```
 
+To share request-count policy counters across workers or processes with Redis:
+
+```bash
+pip install response-bandwidth-limiter[redis]
+```
+
 ## Basic Usage
 
 ### FastAPI
@@ -111,6 +117,32 @@ app = Starlette(routes=routes)
 limiter.init_app(app)
 ```
 
+### Shared Request-Count Counters with Redis
+
+```python
+import os
+
+from fastapi import FastAPI, Request
+from starlette.responses import PlainTextResponse
+
+from response_bandwidth_limiter import RedisBackend, Reject, ResponseBandwidthLimiter, Rule
+
+app = FastAPI()
+limiter = ResponseBandwidthLimiter(
+    counter_backend=RedisBackend.from_url(os.environ["REDIS_URL"], failure_mode="open"),
+    trusted_proxy_headers=True,
+)
+
+@app.get("/shared")
+@limiter.limit_rules([Rule(count=5, per="second", action=Reject(detail="Too many requests from the same IP"))])
+async def shared_policy(request: Request):
+    return PlainTextResponse("shared counter")
+
+limiter.init_app(app)
+```
+
+`RedisBackend` keeps request-count policy counters in Redis, so those counters can be shared across multiple workers, threads, or servers. The backend uses the same sliding-window semantics as the default in-memory evaluator. Redis server 5.0 or later is required.
+
 ## Runtime Updates
 
 The limiter owns all configuration. Update it through methods instead of mutating dictionaries directly.
@@ -150,12 +182,14 @@ async def set_policy(endpoint: str, mode: str):
 
 The admin endpoints above are intentionally minimal examples. Protect similar endpoints with your application's normal authentication and authorization.
 
-For runnable examples, see [example/main.py](example/main.py) and [example/dynamic_limit_example.py](example/dynamic_limit_example.py).
+For runnable examples, see [example/main.py](example/main.py), [example/dynamic_limit_example.py](example/dynamic_limit_example.py), and [example/redis_shared_policy_example.py](example/redis_shared_policy_example.py).
 
 ## Limitations and Considerations
 
 - Limits are applied server-side, so real transfer speed also depends on network conditions.
-- Request-count policies are in-memory. In a distributed deployment, counters are not shared across processes or servers.
+- Request-count policies use `InMemoryBackend` by default, so counters are not shared across processes or servers unless you configure `RedisBackend`.
+- `RedisBackend` requires Redis server 5.0 or later.
+- `update_policy()` and `update_route()` remain process-local runtime changes even when request counters are shared through Redis.
 - If request identity comes from `X-Forwarded-For`, only trust that header behind a trusted reverse proxy that rewrites or sanitizes it.
 - Malformed proxy header values are ignored and the middleware falls back to the direct client address.
 
@@ -165,7 +199,7 @@ For runnable examples, see [example/main.py](example/main.py) and [example/dynam
 
 ```python
 class ResponseBandwidthLimiter:
-    def __init__(self, key_func=None, trusted_proxy_headers: bool = False): ...
+    def __init__(self, key_func=None, trusted_proxy_headers: bool = False, counter_backend: CounterBackend | None = None): ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
     def init_app(self, app, install_signal_handlers: bool = True): ...
@@ -189,11 +223,26 @@ class ResponseBandwidthLimiter:
 
 `key_func` lets you override the client identifier used by request-count policies.
 `trusted_proxy_headers` is `False` by default. Enable it only behind a trusted reverse proxy that rewrites `X-Forwarded-For` or `X-Real-IP`.
+`counter_backend` controls where request-count policy counters are stored. If omitted, `InMemoryBackend` is used.
 The decorators only register limiter configuration and preserve the endpoint's original signature.
 
 - `routes` exposes the currently configured bandwidth limits.
 - `policies` exposes the currently configured request-count rules.
 - `configured_names` returns the union of names configured by routes and policies.
+
+### `CounterBackend`, `InMemoryBackend`, `RedisBackend`
+
+```python
+class CounterBackend: ...
+class InMemoryBackend(CounterBackend): ...
+class RedisBackend(CounterBackend): ...
+```
+
+- `InMemoryBackend` keeps the existing process-local sliding-window behavior.
+- `RedisBackend.from_url("redis://...")` creates a Redis-backed counter store that shares request counts across workers and servers.
+- `RedisBackend` supports `failure_mode="open"`, `"closed"`, and `"local-memory-fallback"`.
+- `key_hash=True` hashes only the request-key tail of the Redis key when the raw request identifier would make keys too long.
+- `RedisBackend` requires Redis server 5.0 or later.
 
 ### `Rule`, `Reject`, `Delay`, `Throttle`
 

@@ -4,7 +4,8 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse
-from response_bandwidth_limiter import ActionProtocol, Delay, PolicyDecision, Reject, ResponseBandwidthLimiter, Rule, Throttle, get_endpoint_name, get_route_path
+from response_bandwidth_limiter import ActionProtocol, CounterBackend, Delay, PolicyDecision, Reject, ResponseBandwidthLimiter, Rule, Throttle, get_endpoint_name, get_route_path
+from response_bandwidth_limiter.backend import HitResult
 from response_bandwidth_limiter.policy import PolicyEvaluator
 
 # デコレータAPIのテスト
@@ -242,13 +243,14 @@ def test_init_app_exposes_policies_and_routes():
     assert limiter.get_rules("download")[0].count == 1
 
 
-def test_policy_evaluator_limits_counter_growth():
+@pytest.mark.asyncio
+async def test_policy_evaluator_limits_counter_growth():
     evaluator = PolicyEvaluator(time_provider=lambda: 1.0, max_counters=2)
     rule = Rule(count=1, per="second", action=Reject())
 
-    evaluator.evaluate("client-a", "download", [rule])
-    evaluator.evaluate("client-b", "download", [rule])
-    evaluator.evaluate("client-c", "download", [rule])
+    await evaluator.evaluate("client-a", "download", [rule])
+    await evaluator.evaluate("client-b", "download", [rule])
+    await evaluator.evaluate("client-c", "download", [rule])
 
     assert len(evaluator.request_counters) == 2
 
@@ -284,31 +286,34 @@ def test_response_streamer_rejects_invalid_chunk_size():
         ResponseStreamer(chunk_size=-1)
 
 
-def test_policy_evaluator_cleanup_expired_removes_stale_counters():
+@pytest.mark.asyncio
+async def test_policy_evaluator_cleanup_expired_removes_stale_counters():
     now = [0.0]
     evaluator = PolicyEvaluator(time_provider=lambda: now[0])
     rule = Rule(count=1, per="second", action=Reject())
 
-    evaluator.evaluate("client-a", "download", [rule])
+    await evaluator.evaluate("client-a", "download", [rule])
     assert len(evaluator.request_counters) == 1
 
     now[0] = 10.0
-    evaluator.cleanup_expired({"download": [rule]})
+    await evaluator.cleanup_expired({"download": [rule]})
     assert len(evaluator.request_counters) == 0
 
 
-def test_policy_evaluator_cleanup_expired_removes_orphaned_counters():
+@pytest.mark.asyncio
+async def test_policy_evaluator_cleanup_expired_removes_orphaned_counters():
     evaluator = PolicyEvaluator(time_provider=lambda: 1.0)
     rule = Rule(count=1, per="second", action=Reject())
 
-    evaluator.evaluate("client-a", "download", [rule])
+    await evaluator.evaluate("client-a", "download", [rule])
     assert len(evaluator.request_counters) == 1
 
-    evaluator.cleanup_expired({})
+    await evaluator.cleanup_expired({})
     assert len(evaluator.request_counters) == 0
 
 
-def test_policy_evaluator_selects_highest_priority_action():
+@pytest.mark.asyncio
+async def test_policy_evaluator_selects_highest_priority_action():
     now = [0.0]
     evaluator = PolicyEvaluator(time_provider=lambda: now[0])
     rules = [
@@ -317,8 +322,29 @@ def test_policy_evaluator_selects_highest_priority_action():
         Rule(count=1, per="second", action=Delay(seconds=0.5)),
     ]
 
-    evaluator.evaluate("client", "endpoint", rules)
-    result = evaluator.evaluate("client", "endpoint", rules)
+    await evaluator.evaluate("client", "endpoint", rules)
+    result = await evaluator.evaluate("client", "endpoint", rules)
 
     assert result is not None
     assert isinstance(result.rule.action, Reject)
+
+
+@pytest.mark.asyncio
+async def test_policy_evaluator_uses_custom_counter_backend():
+    class StubBackend(CounterBackend):
+        def __init__(self):
+            self.calls = []
+
+        async def record_hit(self, request_key, handler_name, rule_index, window_seconds):
+            self.calls.append((request_key, handler_name, rule_index, window_seconds))
+            return HitResult(hit_count=2, oldest_timestamp=1.0, current_timestamp=1.1)
+
+    backend = StubBackend()
+    evaluator = PolicyEvaluator(backend=backend)
+    rule = Rule(count=1, per="second", action=Reject())
+
+    result = await evaluator.evaluate("client-a", "download", [rule])
+
+    assert result is not None
+    assert isinstance(result.rule.action, Reject)
+    assert backend.calls == [("client-a", "download", 0, 1)]
