@@ -27,9 +27,9 @@ class StorageUnavailableError(RuntimeError):
 
 def _validate_limit(name: str, value: int) -> None:
     if not isinstance(value, int):
-        raise TypeError(f"{name} は整数である必要があります。")
+        raise TypeError(f"{name} must be an integer.")
     if value <= 0:
-        raise ValueError(f"{name} は1以上である必要があります。")
+        raise ValueError(f"{name} must be greater than 0.")
 
 
 def _validate_expire(expire: int | None) -> None:

@@ -58,7 +58,7 @@ limiter.init_app(app)
 
 `init_app()` が正式な登録方法です。middleware の追加と `app.state` への保持をまとめて行います。
 
-`init_app(app, install_signal_handlers=True)` は既定で `SIGINT` と連動する shutdown 制御も有効化します。1回目の `Ctrl+C` で drain モードに入り、新しい帯域制限付きレスポンスは `503` で拒否し、進行中の帯域制限レスポンスは継続します。2回目の `Ctrl+C` では abort モードへ昇格し、レスポンス完了まで待たずに帯域制限中の送信を停止します。shutdown を自前で制御したい場合は `install_signal_handlers=False` を指定してください。
+`init_app(app, install_signal_handlers=True)` は既定で `SIGINT` と連動する shutdown 制御も有効化します。1回目の `Ctrl+C` で drain モードに入り、帯域制限または request count policy が設定されたルートへの新規リクエストは `503` で拒否し、進行中の帯域制限ストリーミング応答は継続します。2回目の `Ctrl+C` では abort モードへ昇格し、レスポンス完了まで待たずに帯域制限中の送信を停止します。shutdown を自前で制御したい場合は `install_signal_handlers=False` を指定してください。
 
 ### `limit_rules` による request count policy
 
@@ -180,9 +180,62 @@ async def set_policy(endpoint: str, mode: str):
     return {"status": "success", "endpoint": endpoint}
 ```
 
+### endpoint identifier の選び方
+
+`update_route()` と `update_policy()` に渡す `endpoint` は、関数名だけではなく identifier です。
+
+- limiter は identifier を、エンドポイント関数名、`route.name`、先頭の `/` を除いた route path template、`_response` または `_endpoint` で終わる関数名のベース名、の順で確認します。
+- `@limiter.limit(...)` と `@limiter.limit_rules(...)` は常にエンドポイント関数名で登録します。
+- `/items/{item_id}` のような動的ルートで route path を使う場合、identifier は `/items/123` ではなく `items/{item_id}` です。
+- `resolve_handler_identifier(request)` を使うと、`init_app()` 後にその request で実際に使われる identifier を確認できます。
+- `get_endpoint_name(request)` と `get_route_path(request)` は生の request 情報を返す helper であり、limiter の最終的な identifier と一致しない場合があります。
+
 上記の `/admin` エンドポイントは説明用の最小サンプルです。本番環境では通常の認証・認可を必ず追加してください。
 
-実行可能なサンプルは [example/main.py](example/main.py)、[example/dynamic_limit_example.py](example/dynamic_limit_example.py)、[example/redis_shared_policy_example.py](example/redis_shared_policy_example.py)、[example/ip_limiting_example.py](example/ip_limiting_example.py) を参照してください。
+実行可能なサンプルは [example/main.py](example/main.py)、[example/dynamic_limit_example.py](example/dynamic_limit_example.py)、[example/redis_shared_policy_example.py](example/redis_shared_policy_example.py)、[example/ip_limiting_example.py](example/ip_limiting_example.py)、[example/custom_scope_example.py](example/custom_scope_example.py) を参照してください。
+
+## カスタム request scope
+
+`Rule.scope` ごとに、request count policy のグルーピング単位を切り替えられます。
+
+```python
+from fastapi import FastAPI, Request
+from starlette.responses import PlainTextResponse
+
+from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, Rule
+
+app = FastAPI()
+limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+limiter.register_scope_resolver("api_key", lambda request: request.headers.get("X-Api-Key", "anonymous"))
+limiter.register_scope_resolver("user", lambda request: request.headers.get("X-User-Id", "anonymous"))
+
+@app.get("/download")
+@limiter.limit_rules([
+    Rule(count=5, per="second", action=Reject(detail="同一IPからのリクエストが多すぎます"), scope="ip"),
+    Rule(count=20, per="minute", action=Reject(detail="同一APIキーからのリクエストが多すぎます"), scope="api_key"),
+    Rule(count=3, per="second", action=Delay(seconds=0.25), scope="user"),
+])
+async def download(request: Request):
+    return PlainTextResponse("ok")
+
+limiter.init_app(app)
+```
+
+- `scope="ip"` は middleware が解決した実 IP を常に使います。
+- `scope="default"` は middleware 組み込みの proxy-aware なクライアント識別子を使い、最後に直接接続元または `"unknown"` へフォールバックします。
+- それ以外の scope 名は、`limit_rules()` または `update_policy()` の前に `register_scope_resolver()` で登録する必要があります。
+- `register_scope_resolver()` に渡す resolver は同期関数である必要があり、同じ custom scope 名は 1 回だけ登録できます。
+- 登録済み custom resolver が例外を投げた場合、middleware は警告を出し、実 IP にフォールバックします。
+- IP block / allow は従来どおり常に実 IP を使います。
+- API キーやユーザー単位の集計は、`api_key` や `user` のような explicit な custom scope 名を使ってください。
+
+## 移行メモ
+
+- `key_func` は削除されました。
+- `scope="ip"` は strict な実 IP 集計になりました。
+- `key_func=...` の代わりに `register_scope_resolver("api_key", ...)` を登録し、rule 側で `scope="api_key"` などの explicit な custom scope 名を指定してください。
+- `scope="default"` は middleware 組み込みの proxy-aware なクライアント識別子を意味します。
+- custom scope 名は `limit_rules()` / `update_policy()` の前に登録する必要があります。
 
 ## 制限事項と注意点
 
@@ -191,9 +244,12 @@ async def set_policy(endpoint: str, mode: str):
 - `ManagerStorage` は experimental です。低速で、一貫性は保証されず、高負荷環境には不向きです。
 - `RedisStorage` を使う場合、Redis サーバーは 5.0 以上が必要です。
 - `update_policy()` と `update_route()` の実行時更新は、RedisStorage 利用時でも引き続きプロセスローカルです。
-- `key_func` は request count policy の識別子だけを上書きします。IP block / allow は常に実 IP を使います。
+- `scope="default"` は built-in の proxy-aware なクライアント識別子を使います。`scope="ip"` と IP block / allow は常に実 IP を使います。
+- custom scope は `limit_rules()` / `update_policy()` の前に登録する必要があります。未登録 scope は設定時に fail-fast します。
+- custom scope resolver は同期関数である必要があり、重複する scope 名は登録時に拒否されます。
 - `X-Forwarded-For` を識別に使う場合は、信頼できるリバースプロキシの背後でのみその値を信用してください。
 - 不正な proxy header 値は無視され、middleware は直接接続元のアドレスへフォールバックします。
+- 既存の Redis 共有カウンタを使う rule を `key_func` ベースの集計から `api_key` のような explicit な custom scope へ移行すると、Redis キー内の request key 部分が変わります。既存バケットはウィンドウ経過で自然に消えます。
 
 ## APIリファレンス
 
@@ -201,7 +257,10 @@ async def set_policy(endpoint: str, mode: str):
 
 ```python
 class ResponseBandwidthLimiter:
-    def __init__(self, key_func=None, trusted_proxy_headers: bool = False, storage: Storage | None = None): ...
+    def __init__(self, trusted_proxy_headers: bool = False, storage: Storage | None = None): ...
+    def register_scope_resolver(self, scope_name: str, resolver: ScopeResolver): ...
+    def scope_resolvers(self) -> Mapping[str, ScopeResolver]: ...  # property
+    def resolve_handler_identifier(self, request: Request) -> str | None: ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
     def init_app(self, app, install_signal_handlers: bool = True): ...
@@ -234,11 +293,17 @@ class ResponseBandwidthLimiter:
     def configured_names(self) -> set[str]: ...
 ```
 
-`key_func` を指定すると、request count policy で使うクライアント識別子を独自に決められます。
 `trusted_proxy_headers` の既定値は `False` です。`X-Forwarded-For` や `X-Real-IP` を信頼できるリバースプロキシ配下でのみ `True` にしてください。
 `storage` には request count policy と IP block / allow の保存先を指定します。省略時は `InMemoryStorage` が使われます。
 デコレータは limiter の設定だけを登録し、エンドポイントの元のシグネチャは保持されます。
 
+- `register_scope_resolver(scope_name, resolver)` は custom request-count scope を登録します。その scope を使う rule を設定する前に呼んでください。
+- resolver は同期関数である必要があり、同じ custom scope 名は 1 回だけ登録できます。
+- scope 名の前後空白は validation 時に自動で除去されます。
+- `scope_name="ip"` と `scope_name="default"` は予約済みの built-in scope で、上書きできません。
+- `scope_resolvers` は登録済みのすべての custom scope 名と resolver の読み取り専用マッピングを返します。
+- `resolve_handler_identifier(request)` は、その request に対して `update_route()` / `update_policy()` が参照する identifier を返します。`init_app()` 後、または `scope["app"]` を持つ request で使ってください。
+- endpoint identifier は、エンドポイント関数名、`route.name`、先頭の `/` を除いた route path template、`_response` / `_endpoint` suffix の順で解決されます。
 - `routes` は現在設定されている帯域制限を返します。
 - `policies` は現在設定されている request count rule を返します。
 - `configured_names` は route と policy の両方で設定済みの名前集合を返します。
@@ -272,7 +337,10 @@ Throttle(bytes_per_sec: int)
 
 - `per` は `second`、`minute`、`hour` と、正の `datetime.timedelta` をサポートします。
 - `timedelta` は1秒単位の値だけ受け付けます。
-- `scope` は現状 `ip` のみです。
+- `scope` は built-in の `ip` と `default`、および `register_scope_resolver()` で登録した custom 名をサポートします。
+- `scope` の前後空白は validation 時に自動で除去されます。
+- `scope="ip"` は常に実 IP で集計します。
+- `scope="default"` は middleware 組み込みの proxy-aware なクライアント識別子を使い、最後に直接接続元または `"unknown"` へフォールバックします。
 - Action には `priority`、`sort_key`、`to_dict()` があります。
 - 複数の rule が同じリクエストに一致した場合、middleware はそれらを独立して評価し、`priority` が最も小さい action を 1 つだけ選びます。
 - 組み込み action の優先順は `Reject` (0)、`Delay` (1)、`Throttle` (2) です。

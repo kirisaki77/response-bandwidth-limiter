@@ -39,4 +39,4 @@ class IPManager:
         try:
             return str(ip_address(ip))
         except ValueError as exc:
-            raise ValueError("ip は有効なIPアドレスである必要があります。") from exc
+            raise ValueError("ip must be a valid IP address.") from exc

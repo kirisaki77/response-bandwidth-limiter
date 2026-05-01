@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import signal
 import threading
 from ipaddress import ip_address
@@ -16,6 +17,10 @@ from .policy import MatchedPolicy, PolicyEvaluator
 from .shutdown import ShutdownCoordinator, ShutdownMode
 from .storage import StorageUnavailableError
 from .streaming import ResponseStreamer, StreamingAbortedError
+from .util import _find_configured_handler_name
+
+
+logger = logging.getLogger(__name__)
 
 class ResponseBandwidthLimiterMiddleware:
     chunk_size = 8192
@@ -44,52 +49,6 @@ class ResponseBandwidthLimiterMiddleware:
         self._signal_lock = threading.Lock()
         self._signal_handler_installed = False
         self._original_sigint_handler: Any = None
-
-    def _get_limit_name(self, route: Any, endpoint: Any, path: str, configured_names: set[str]) -> Optional[str]:
-        endpoint_name = getattr(endpoint, "__name__", None)
-        if endpoint_name in configured_names:
-            return endpoint_name
-
-        route_name = getattr(route, "name", None)
-        if route_name in configured_names:
-            return route_name
-
-        route_path = getattr(route, "path", path).strip("/")
-        if route_path in configured_names:
-            return route_path
-
-        if endpoint_name:
-            for suffix in ["_response", "_endpoint"]:
-                if endpoint_name.endswith(suffix):
-                    base_name = endpoint_name[:-len(suffix)]
-                    if base_name in configured_names:
-                        return base_name
-
-        return None
-
-    def _find_handler_name(self, routes: list[Any], scope: Scope, path: str, configured_names: set[str]) -> Optional[str]:
-        for route in routes:
-            if not hasattr(route, "matches"):
-                continue
-
-            match, child_scope = route.matches(scope)
-            if match != Match.FULL:
-                continue
-
-            endpoint = child_scope.get("endpoint", getattr(route, "endpoint", None))
-            handler_name = self._get_limit_name(route, endpoint, path, configured_names)
-            if handler_name is not None:
-                return handler_name
-
-            nested_routes = getattr(route, "routes", None)
-            if nested_routes:
-                nested_scope = scope.copy()
-                nested_scope.update(child_scope)
-                handler_name = self._find_handler_name(nested_routes, nested_scope, path, configured_names)
-                if handler_name is not None:
-                    return handler_name
-
-        return None
 
     async def _yield_limited_chunks(
         self,
@@ -166,15 +125,8 @@ class ResponseBandwidthLimiterMiddleware:
     def _get_client_identifier(
         self,
         request: Request,
-        key_func: Optional[Callable[[Request], Any]],
         trust_proxy_headers: bool = False,
     ) -> str:
-        if callable(key_func):
-            try:
-                return str(key_func(request))
-            except Exception:
-                pass
-
         if trust_proxy_headers:
             forwarded_ip = self._extract_valid_ip(request.headers.get("x-forwarded-for"))
             if forwarded_ip is not None:
@@ -224,9 +176,57 @@ class ResponseBandwidthLimiterMiddleware:
         self,
         handler_name: str,
         rules: list[Rule],
-        request_identifier: str,
+        scope_identifiers: dict[str, str],
     ) -> Optional[MatchedPolicy]:
-        return await self.policy_evaluator.evaluate(request_identifier, handler_name, rules)
+        return await self.policy_evaluator.evaluate(scope_identifiers, handler_name, rules)
+
+    def _resolve_scope_identifiers(self, request: Request, rules: list[Rule], limiter: Any) -> dict[str, str]:
+        scope_identifiers: dict[str, str] = {}
+        trust_proxy_headers = getattr(limiter, "trusted_proxy_headers", False)
+
+        for rule in rules:
+            scope_name = rule.scope
+            if scope_name in scope_identifiers:
+                continue
+
+            if scope_name == "ip":
+                scope_identifiers[scope_name] = self._get_client_ip(request, trust_proxy_headers) or "unknown"
+                continue
+
+            if scope_name == "default":
+                scope_identifiers[scope_name] = self._get_client_identifier(request, trust_proxy_headers)
+                continue
+
+            resolver = getattr(limiter, "_get_scope_resolver", None)
+            if not callable(resolver):
+                raise ValueError(f"Cannot resolve a resolver getter for scope {scope_name!r}.")
+
+            scope_resolver = resolver(scope_name)
+            if scope_resolver is None:
+                raise ValueError(f"scope {scope_name!r} is not registered.")
+
+            try:
+                resolved = scope_resolver(request)
+            except Exception:
+                logger.warning(
+                    "Scope resolver %r raised an exception. Falling back to the real client IP.",
+                    scope_name,
+                    exc_info=True,
+                )
+                scope_identifiers[scope_name] = self._get_client_ip(request, trust_proxy_headers) or "unknown"
+                continue
+
+            str_value = str(resolved) if resolved is not None else ""
+            if not str_value.strip():
+                logger.warning(
+                    "Scope resolver %r returned an empty value. Falling back to the real client IP.",
+                    scope_name,
+                )
+                scope_identifiers[scope_name] = self._get_client_ip(request, trust_proxy_headers) or "unknown"
+            else:
+                scope_identifiers[scope_name] = str_value
+
+        return scope_identifiers
 
     def _build_reject_response(self, decision: PolicyDecision) -> JSONResponse:
         headers = {"Retry-After": str(decision.retry_after)}
@@ -244,7 +244,7 @@ class ResponseBandwidthLimiterMiddleware:
             status_code=503,
             content={
                 "error": "Server shutting down",
-                "detail": "The server is shutting down and cannot accept throttled responses.",
+                "detail": "The server is shutting down and cannot accept new requests for routes managed by the limiter.",
             },
         )
 
@@ -287,7 +287,7 @@ class ResponseBandwidthLimiterMiddleware:
 
         # ルートを探索
         routes = getattr(app, "routes", [])
-        return self._find_handler_name(routes, request.scope, path, configured_names)
+        return _find_configured_handler_name(routes, request.scope, path, configured_names)
 
     async def _send_limited_body(
         self,
@@ -384,13 +384,19 @@ class ResponseBandwidthLimiterMiddleware:
 
         decision = None
         if rules:
-            request_identifier = self._get_client_identifier(
-                request,
-                limiter.key_func,
-                getattr(limiter, "trusted_proxy_headers", False),
-            )
             try:
-                matched_rule = None if ip_allowed else await self._evaluate_policy_rules(handler_name, rules, request_identifier)
+                scope_identifiers = self._resolve_scope_identifiers(request, rules, limiter)
+            except ValueError:
+                logger.error(
+                    "Scope resolution failed for handler %r. Returning 503.",
+                    handler_name,
+                    exc_info=True,
+                )
+                response = self._build_backend_unavailable_response()
+                await response(scope, receive, send)
+                return
+            try:
+                matched_rule = None if ip_allowed else await self._evaluate_policy_rules(handler_name, rules, scope_identifiers)
             except StorageUnavailableError:
                 response = self._build_backend_unavailable_response()
                 await response(scope, receive, send)

@@ -9,17 +9,17 @@ VALID_PERIODS = {"second": 1, "minute": 60, "hour": 3600}
 def _resolve_window_seconds(period: str | timedelta) -> int:
     if isinstance(period, str):
         if period not in VALID_PERIODS:
-            raise ValueError("per は second, minute, hour のいずれか、または正の timedelta である必要があります。")
+            raise ValueError("per must be one of second, minute, hour, or a positive timedelta.")
         return VALID_PERIODS[period]
 
     if not isinstance(period, timedelta):
-        raise TypeError("per は文字列または timedelta である必要があります。")
+        raise TypeError("per must be a string or timedelta.")
 
     if period <= timedelta(0):
-        raise ValueError("per に timedelta を指定する場合は0より大きい必要があります。")
+        raise ValueError("timedelta values for per must be greater than 0.")
 
     if period.microseconds != 0:
-        raise ValueError("per に timedelta を指定する場合は1秒単位である必要があります。")
+        raise ValueError("timedelta values for per must use whole seconds.")
 
     return int(period.total_seconds())
 
@@ -57,9 +57,9 @@ class Throttle:
 
     def __post_init__(self) -> None:
         if not isinstance(self.bytes_per_sec, int):
-            raise TypeError("bytes_per_sec は整数である必要があります。")
+            raise TypeError("bytes_per_sec must be an integer.")
         if self.bytes_per_sec <= 0:
-            raise ValueError("bytes_per_sec は1以上である必要があります。")
+            raise ValueError("bytes_per_sec must be greater than 0.")
 
     @property
     def priority(self) -> int:
@@ -83,13 +83,13 @@ class Reject:
 
     def __post_init__(self) -> None:
         if not isinstance(self.status_code, int):
-            raise TypeError("status_code は整数である必要があります。")
+            raise TypeError("status_code must be an integer.")
         if self.status_code < 400:
-            raise ValueError("status_code は400以上である必要があります。")
+            raise ValueError("status_code must be at least 400.")
         if self.status_code > 599:
-            raise ValueError("status_code は599以下である必要があります。")
+            raise ValueError("status_code must be at most 599.")
         if not isinstance(self.detail, str):
-            raise TypeError("detail は文字列である必要があります。")
+            raise TypeError("detail must be a string.")
 
     @property
     def priority(self) -> int:
@@ -117,9 +117,9 @@ class Delay:
 
     def __post_init__(self) -> None:
         if not isinstance(self.seconds, (int, float)):
-            raise TypeError("seconds は数値である必要があります。")
+            raise TypeError("seconds must be a number.")
         if self.seconds <= 0:
-            raise ValueError("seconds は0より大きい必要があります。")
+            raise ValueError("seconds must be greater than 0.")
 
     @property
     def priority(self) -> int:
@@ -148,14 +148,18 @@ class Rule:
 
     def __post_init__(self) -> None:
         if not isinstance(self.count, int):
-            raise TypeError("count は整数である必要があります。")
+            raise TypeError("count must be an integer.")
         if self.count <= 0:
-            raise ValueError("count は1以上である必要があります。")
+            raise ValueError("count must be greater than 0.")
         _resolve_window_seconds(self.per)
-        if self.scope != "ip":
-            raise ValueError("scope は現在 ip のみ対応しています。")
+        if not isinstance(self.scope, str):
+            raise TypeError("scope must be a string.")
+        normalized_scope = self.scope.strip()
+        if not normalized_scope:
+            raise ValueError("scope must be a non-empty string.")
+        object.__setattr__(self, "scope", normalized_scope)
         if not isinstance(self.action, ActionProtocol):
-            raise TypeError("action は ActionProtocol を実装している必要があります。")
+            raise TypeError("action must implement ActionProtocol.")
 
     @property
     def window_seconds(self) -> int:

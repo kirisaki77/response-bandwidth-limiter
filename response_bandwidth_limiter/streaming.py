@@ -12,13 +12,13 @@ class ResponseStreamer:
 
     def __init__(self, chunk_size: int = 8192, sleep_func=asyncio.sleep):
         if chunk_size <= 0:
-            raise ValueError("chunk_size は1以上である必要があります。")
+            raise ValueError("chunk_size must be greater than 0.")
         self.chunk_size = chunk_size
         self._sleep_func = sleep_func
 
     def _check_abort(self, abort_check: Callable[[], bool] | None) -> None:
         if abort_check is not None and abort_check():
-            raise StreamingAbortedError("レスポンス送信が中断されました。")
+            raise StreamingAbortedError("Response streaming was aborted.")
 
     async def _sleep_with_abort_check(
         self,
@@ -53,7 +53,7 @@ class ResponseStreamer:
         poll_check: Callable[[], bool] | None = None,
     ) -> AsyncIterator[bytes]:
         if max_rate <= 0:
-            raise ValueError("max_rate は1以上である必要があります。")
+            raise ValueError("max_rate must be greater than 0.")
         effective_chunk_size = max(1, min(self.chunk_size, max_rate))
         for index in range(0, len(chunk), effective_chunk_size):
             self._check_abort(abort_check)
