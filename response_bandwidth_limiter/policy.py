@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Mapping, Optional, Tuple
 
 from .storage import InMemoryStorage, SlidingWindowResult, Storage
 from .models import Rule
@@ -31,7 +31,7 @@ class PolicyEvaluator:
         max_counters: int = 10000,
     ):
         if storage is not None and not isinstance(storage, Storage):
-            raise TypeError("storage は Storage を実装している必要があります。")
+            raise TypeError("storage must implement Storage.")
         self._storage = storage or InMemoryStorage(time_provider=time_provider, max_counters=max_counters)
 
     @property
@@ -45,10 +45,18 @@ class PolicyEvaluator:
             return {}
         return dict(counters)
 
-    async def evaluate(self, request_key: str, handler_name: str, rules: List[Rule]) -> Optional[MatchedPolicy]:
+    async def evaluate(
+        self,
+        scope_identifiers: Mapping[str, str],
+        handler_name: str,
+        rules: List[Rule],
+    ) -> Optional[MatchedPolicy]:
         matched_actions: List[_CandidateAction] = []
 
         for index, rule in enumerate(rules):
+            request_key = scope_identifiers.get(rule.scope)
+            if request_key is None:
+                raise ValueError(f"No identifier was resolved for scope {rule.scope!r}.")
             hit_result = await self._storage.record_hit(request_key, handler_name, index, rule.window_seconds)
             if hit_result.hit_count > rule.count:
                 retry_after = self._retry_after_seconds(

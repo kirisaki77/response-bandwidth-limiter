@@ -386,9 +386,9 @@ async def test_redis_storage_shares_counters_across_evaluators():
     rule = Rule(count=1, per="second", action=Reject())
 
     try:
-        assert await evaluator_one.evaluate("203.0.113.10", "download", [rule]) is None
+        assert await evaluator_one.evaluate({"ip": "203.0.113.10"}, "download", [rule]) is None
 
-        result = await evaluator_two.evaluate("203.0.113.10", "download", [rule])
+        result = await evaluator_two.evaluate({"ip": "203.0.113.10"}, "download", [rule])
 
         assert result is not None
         assert isinstance(result.rule.action, Reject)

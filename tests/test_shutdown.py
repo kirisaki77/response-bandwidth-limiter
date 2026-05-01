@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse, StreamingResponse
 
-from response_bandwidth_limiter import ResponseBandwidthLimiter, ShutdownMode
+from response_bandwidth_limiter import Reject, ResponseBandwidthLimiter, Rule, ShutdownMode
 from response_bandwidth_limiter.middleware import ResponseBandwidthLimiterMiddleware
 from response_bandwidth_limiter.shutdown import ShutdownCoordinator
 from response_bandwidth_limiter.storage import InMemoryStorage
@@ -121,6 +121,26 @@ def test_shutdown_rejects_new_requests_with_503():
 
     assert response.status_code == 503
     assert response.json()["error"] == "Server shutting down"
+    assert response.json()["detail"] == "The server is shutting down and cannot accept new requests for routes managed by the limiter."
+
+
+def test_shutdown_rejects_policy_only_requests_with_503():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.init_app(app, install_signal_handlers=False)
+
+    @app.get("/limited")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="too many requests"))])
+    async def limited():
+        return PlainTextResponse("payload")
+
+    limiter.begin_shutdown(ShutdownMode.DRAIN)
+
+    response = TestClient(app).get("/limited")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "Server shutting down"
+    assert response.json()["detail"] == "The server is shutting down and cannot accept new requests for routes managed by the limiter."
 
 
 def test_shutdown_drain_allows_existing_stream_to_finish():

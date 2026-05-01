@@ -159,8 +159,11 @@ def test_rule_and_action_validation_rejects_invalid_types_and_scope():
     with pytest.raises(TypeError):
         Reject(detail=123)
 
+    with pytest.raises(TypeError):
+        Rule(count=1, per="second", action=Reject(), scope=123)
+
     with pytest.raises(ValueError):
-        Rule(count=1, per="second", action=Reject(), scope="global")
+        Rule(count=1, per="second", action=Reject(), scope="")
 
     with pytest.raises(TypeError):
         Rule(count=1, per=123, action=Reject())
@@ -179,6 +182,12 @@ def test_rule_window_seconds_supports_timedelta_periods():
     assert Rule(count=1, per=timedelta(seconds=1), action=Reject()).window_seconds == 1
     assert Rule(count=1, per=timedelta(minutes=30), action=Reject()).window_seconds == 1800
     assert Rule(count=1, per=timedelta(hours=1), action=Reject()).window_seconds == 3600
+
+
+def test_rule_normalizes_scope_whitespace():
+    rule = Rule(count=1, per="second", action=Reject(), scope=" user ")
+
+    assert rule.scope == "user"
 
 
 def test_action_priority_values_are_stable():
@@ -220,6 +229,75 @@ def test_rule_accepts_custom_action_protocol():
     assert Rule(count=1, per="second", action=action).action is action
 
 
+def test_custom_scope_must_be_registered_before_policy_configuration():
+    limiter = ResponseBandwidthLimiter()
+    rule = Rule(count=1, per="second", action=Reject(), scope="user")
+
+    with pytest.raises(ValueError, match="register_scope_resolver"):
+        limiter.limit_rules([rule])
+
+    with pytest.raises(ValueError, match="register_scope_resolver"):
+        limiter.update_policy("download", [rule])
+
+
+def test_register_scope_resolver_accepts_custom_names_only():
+    limiter = ResponseBandwidthLimiter()
+
+    with pytest.raises(ValueError):
+        limiter.register_scope_resolver("ip", lambda request: "client")
+
+    with pytest.raises(ValueError):
+        limiter.register_scope_resolver("default", lambda request: "client")
+
+    with pytest.raises(TypeError):
+        limiter.register_scope_resolver("user", "invalid")
+
+    limiter.register_scope_resolver("user", lambda request: request.headers.get("X-User", "anonymous"))
+    limiter.update_policy("download", [Rule(count=1, per="second", action=Reject(), scope="user")])
+
+    assert limiter.get_rules("download")[0].scope == "user"
+
+
+def test_register_scope_resolver_normalizes_whitespace_and_duplicate_names():
+    limiter = ResponseBandwidthLimiter()
+
+    limiter.register_scope_resolver(" user ", lambda request: request.headers.get("X-User", "anonymous"))
+
+    assert set(limiter.scope_resolvers) == {"user"}
+
+    with pytest.raises(ValueError, match="already registered"):
+        limiter.register_scope_resolver("user", lambda request: request.headers.get("X-Other-User", "anonymous"))
+
+
+def test_register_scope_resolver_rejects_whitespace_wrapped_builtin_names():
+    limiter = ResponseBandwidthLimiter()
+
+    with pytest.raises(ValueError):
+        limiter.register_scope_resolver(" ip ", lambda request: "client")
+
+    with pytest.raises(ValueError):
+        limiter.register_scope_resolver(" default ", lambda request: "client")
+
+
+def test_register_scope_resolver_rejects_duplicate_names():
+    limiter = ResponseBandwidthLimiter()
+
+    limiter.register_scope_resolver("user", lambda request: request.headers.get("X-User", "anonymous"))
+
+    with pytest.raises(ValueError, match="already registered"):
+        limiter.register_scope_resolver("user", lambda request: request.headers.get("X-Other-User", "anonymous"))
+
+
+def test_register_scope_resolver_rejects_async_resolvers():
+    limiter = ResponseBandwidthLimiter()
+
+    async def async_resolver(request: Request) -> str:
+        return request.headers.get("X-User", "anonymous")
+
+    with pytest.raises(TypeError, match="synchronous"):
+        limiter.register_scope_resolver("user", async_resolver)
+
+
 def test_util_functions_return_endpoint_and_route_path():
     scope = {
         "type": "http",
@@ -237,6 +315,45 @@ def test_get_endpoint_name_falls_back_to_path():
     request = Request(scope={"type": "http", "path": "/fallback", "method": "GET"})
 
     assert get_endpoint_name(request) == "/fallback"
+
+
+def test_resolve_handler_identifier_requires_initialized_app():
+    limiter = ResponseBandwidthLimiter()
+    request = Request(scope={"type": "http", "path": "/test", "method": "GET"})
+
+    with pytest.raises(ValueError, match="init_app"):
+        limiter.resolve_handler_identifier(request)
+
+
+def test_resolve_handler_identifier_uses_stored_app_route_path_template():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.update_route("items/{item_id}", 100)
+
+    @app.get("/items/{item_id}")
+    async def read_item(item_id: str):
+        return {"item_id": item_id}
+
+    limiter.init_app(app, install_signal_handlers=False)
+    request = Request(scope={"type": "http", "path": "/items/123", "method": "GET"})
+
+    assert limiter.resolve_handler_identifier(request) == "items/{item_id}"
+
+
+def test_resolve_handler_identifier_prefers_endpoint_name_over_route_name():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.update_route("read_test", 100)
+    limiter.update_route("custom_name", 50)
+
+    @app.get("/test", name="custom_name")
+    async def read_test():
+        return {"ok": True}
+
+    limiter.init_app(app, install_signal_handlers=False)
+    request = Request(scope={"type": "http", "path": "/test", "method": "GET", "app": app})
+
+    assert limiter.resolve_handler_identifier(request) == "read_test"
 
 
 def test_get_endpoint_name_uses_callable_name_when_available():
@@ -266,9 +383,9 @@ async def test_policy_evaluator_limits_counter_growth():
     evaluator = PolicyEvaluator(time_provider=lambda: 1.0, max_counters=2)
     rule = Rule(count=1, per="second", action=Reject())
 
-    await evaluator.evaluate("client-a", "download", [rule])
-    await evaluator.evaluate("client-b", "download", [rule])
-    await evaluator.evaluate("client-c", "download", [rule])
+    await evaluator.evaluate({"ip": "client-a"}, "download", [rule])
+    await evaluator.evaluate({"ip": "client-b"}, "download", [rule])
+    await evaluator.evaluate({"ip": "client-c"}, "download", [rule])
 
     assert len(evaluator.request_counters) == 2
 
@@ -311,7 +428,7 @@ async def test_policy_evaluator_cleanup_expired_removes_stale_counters():
     evaluator = PolicyEvaluator(storage=storage)
     rule = Rule(count=1, per="second", action=Reject())
 
-    await evaluator.evaluate("client-a", "download", [rule])
+    await evaluator.evaluate({"ip": "client-a"}, "download", [rule])
     assert len(evaluator.request_counters) == 1
 
     now[0] = 10.0
@@ -325,7 +442,7 @@ async def test_policy_evaluator_cleanup_expired_removes_orphaned_counters():
     evaluator = PolicyEvaluator(storage=storage)
     rule = Rule(count=1, per="second", action=Reject())
 
-    await evaluator.evaluate("client-a", "download", [rule])
+    await evaluator.evaluate({"ip": "client-a"}, "download", [rule])
     assert len(evaluator.request_counters) == 1
 
     storage.cleanup_orphaned_counters({})
@@ -342,8 +459,8 @@ async def test_policy_evaluator_selects_highest_priority_action():
         Rule(count=1, per="second", action=Delay(seconds=0.5)),
     ]
 
-    await evaluator.evaluate("client", "endpoint", rules)
-    result = await evaluator.evaluate("client", "endpoint", rules)
+    await evaluator.evaluate({"ip": "client"}, "endpoint", rules)
+    result = await evaluator.evaluate({"ip": "client"}, "endpoint", rules)
 
     assert result is not None
     assert isinstance(result.rule.action, Reject)
@@ -375,7 +492,7 @@ async def test_policy_evaluator_uses_custom_storage():
     evaluator = PolicyEvaluator(storage=storage)
     rule = Rule(count=1, per="second", action=Reject())
 
-    result = await evaluator.evaluate("client-a", "download", [rule])
+    result = await evaluator.evaluate({"ip": "client-a"}, "download", [rule])
 
     assert result is not None
     assert isinstance(result.rule.action, Reject)
@@ -389,7 +506,7 @@ async def test_limiter_remove_policy_cleans_in_memory_request_counters():
     rule = Rule(count=1, per="second", action=Reject())
     limiter.update_policy("download", [rule])
 
-    await limiter._policy_evaluator.evaluate("client-a", "download", [rule])
+    await limiter._policy_evaluator.evaluate({"ip": "client-a"}, "download", [rule])
     assert len(limiter._policy_evaluator.request_counters) == 1
 
     limiter.remove_policy("download")

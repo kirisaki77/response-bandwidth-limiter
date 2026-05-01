@@ -58,7 +58,7 @@ limiter.init_app(app)
 
 `init_app()` is the supported way to register the limiter. It attaches the middleware and stores the limiter on `app.state`.
 
-`init_app(app, install_signal_handlers=True)` also installs shutdown-aware `SIGINT` handling by default. The first `Ctrl+C` moves the limiter into drain mode, rejects new throttled responses with `503`, and lets existing throttled responses continue. A second `Ctrl+C` promotes shutdown to abort mode and stops in-flight throttled streaming without waiting for the full response to finish. Set `install_signal_handlers=False` if you want to manage shutdown yourself.
+`init_app(app, install_signal_handlers=True)` also installs shutdown-aware `SIGINT` handling by default. The first `Ctrl+C` moves the limiter into drain mode, rejects new requests for routes configured with bandwidth limits or request-count policies with `503`, and lets existing throttled streaming responses continue. A second `Ctrl+C` promotes shutdown to abort mode and stops in-flight throttled streaming without waiting for the full response to finish. Set `install_signal_handlers=False` if you want to manage shutdown yourself.
 
 ### Request-Count Policies with `limit_rules`
 
@@ -180,9 +180,62 @@ async def set_policy(endpoint: str, mode: str):
     return {"status": "success", "endpoint": endpoint}
 ```
 
+### Choosing an endpoint identifier
+
+The `endpoint` parameter in `update_route()` and `update_policy()` is an identifier, not only a function name.
+
+- The limiter checks identifiers in this order: endpoint function name, `route.name`, route path template without the leading slash, then the base name of functions ending in `_response` or `_endpoint`.
+- Decorators such as `@limiter.limit(...)` and `@limiter.limit_rules(...)` always register the endpoint function name first.
+- For a dynamic route such as `/items/{item_id}`, the route-path identifier is `items/{item_id}`, not `/items/123`.
+- `resolve_handler_identifier(request)` returns the identifier that the limiter would use for a specific request after `init_app()`.
+- `get_endpoint_name(request)` and `get_route_path(request)` return raw request metadata and may differ from the resolved limiter identifier.
+
 The admin endpoints above are intentionally minimal examples. Protect similar endpoints with your application's normal authentication and authorization.
 
-For runnable examples, see [example/main.py](example/main.py), [example/dynamic_limit_example.py](example/dynamic_limit_example.py), [example/redis_shared_policy_example.py](example/redis_shared_policy_example.py), and [example/ip_limiting_example.py](example/ip_limiting_example.py).
+For runnable examples, see [example/main.py](example/main.py), [example/dynamic_limit_example.py](example/dynamic_limit_example.py), [example/redis_shared_policy_example.py](example/redis_shared_policy_example.py), [example/ip_limiting_example.py](example/ip_limiting_example.py), and [example/custom_scope_example.py](example/custom_scope_example.py).
+
+## Custom Request Scopes
+
+`Rule.scope` can now choose how each request-count rule groups requests.
+
+```python
+from fastapi import FastAPI, Request
+from starlette.responses import PlainTextResponse
+
+from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, Rule
+
+app = FastAPI()
+limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+limiter.register_scope_resolver("api_key", lambda request: request.headers.get("X-Api-Key", "anonymous"))
+limiter.register_scope_resolver("user", lambda request: request.headers.get("X-User-Id", "anonymous"))
+
+@app.get("/download")
+@limiter.limit_rules([
+    Rule(count=5, per="second", action=Reject(detail="Too many requests from the same IP"), scope="ip"),
+    Rule(count=20, per="minute", action=Reject(detail="Too many requests for this API key"), scope="api_key"),
+    Rule(count=3, per="second", action=Delay(seconds=0.25), scope="user"),
+])
+async def download(request: Request):
+    return PlainTextResponse("ok")
+
+limiter.init_app(app)
+```
+
+- `scope="ip"` always uses the real client IP resolved by the middleware.
+- `scope="default"` uses the middleware's built-in proxy-aware client identifier, then falls back to the direct client address or `"unknown"`.
+- Any other scope name must be registered through `register_scope_resolver()` before calling `limit_rules()` or `update_policy()`.
+- Resolvers passed to `register_scope_resolver()` must be synchronous, and each custom scope name can be registered only once.
+- If a registered custom resolver raises an exception, the middleware logs a warning and falls back to the real client IP.
+- IP block / allow is unchanged and always uses the real client IP.
+- API-key or user-specific grouping should use explicit custom scope names such as `api_key` or `user`.
+
+## Migration Notes
+
+- `key_func` has been removed.
+- `scope="ip"` now means strict real-client-IP counting.
+- Replace `key_func=...` with `register_scope_resolver("api_key", ...)` and point the rule at `scope="api_key"` or another explicit custom scope name.
+- `scope="default"` now means the built-in proxy-aware client identifier.
+- Custom scope names must be registered before `limit_rules()` or `update_policy()`.
 
 ## Limitations and Considerations
 
@@ -191,9 +244,12 @@ For runnable examples, see [example/main.py](example/main.py), [example/dynamic_
 - `ManagerStorage` is experimental, slow, and not suitable for high-load environments. It does not guarantee consistency or exact sliding-window behavior.
 - `RedisStorage` requires Redis server 5.0 or later.
 - `update_policy()` and `update_route()` remain process-local runtime changes even when request counters are shared through Redis.
-- `key_func` only overrides the identifier used by request-count policies. IP block / allow always uses the real client IP.
+- `scope="default"` uses the built-in proxy-aware client identifier. `scope="ip"` and IP block / allow always use the real client IP.
+- Custom scopes must be registered before `limit_rules()` or `update_policy()` runs, because unknown scopes fail fast during configuration.
+- Custom scope resolvers must be synchronous, and duplicate scope names are rejected during registration.
 - If request identity comes from `X-Forwarded-For`, only trust that header behind a trusted reverse proxy that rewrites or sanitizes it.
 - Malformed proxy header values are ignored and the middleware falls back to the direct client address.
+- If you migrate an existing Redis-backed rule from `key_func`-based grouping to an explicit custom scope such as `api_key`, the request-key portion of the Redis counter changes. Existing counter buckets expire naturally after their window passes.
 
 ## API Reference
 
@@ -201,7 +257,10 @@ For runnable examples, see [example/main.py](example/main.py), [example/dynamic_
 
 ```python
 class ResponseBandwidthLimiter:
-    def __init__(self, key_func=None, trusted_proxy_headers: bool = False, storage: Storage | None = None): ...
+    def __init__(self, trusted_proxy_headers: bool = False, storage: Storage | None = None): ...
+    def register_scope_resolver(self, scope_name: str, resolver: ScopeResolver): ...
+    def scope_resolvers(self) -> Mapping[str, ScopeResolver]: ...  # property
+    def resolve_handler_identifier(self, request: Request) -> str | None: ...
     def limit(self, rate: int): ...
     def limit_rules(self, rules: list[Rule]): ...
     def init_app(self, app, install_signal_handlers: bool = True): ...
@@ -234,10 +293,17 @@ class ResponseBandwidthLimiter:
     def configured_names(self) -> set[str]: ...
 ```
 
-`key_func` lets you override the client identifier used by request-count policies.
 `trusted_proxy_headers` is `False` by default. Enable it only behind a trusted reverse proxy that rewrites `X-Forwarded-For` or `X-Real-IP`.
 `storage` controls where request-count policy counters and IP control data are stored. If omitted, `InMemoryStorage` is used.
 The decorators only register limiter configuration and preserve the endpoint's original signature.
+
+- `register_scope_resolver(scope_name, resolver)` registers a custom request-count scope. Call it before `limit_rules()` or `update_policy()` if any rule uses that scope.
+- Resolvers must be synchronous, and each custom scope name can be registered only once.
+- Leading and trailing whitespace in scope names is stripped during validation.
+- `scope_name="ip"` and `scope_name="default"` are reserved built-in scopes and cannot be overridden.
+- `scope_resolvers` returns a read-only mapping of all registered custom scope names to their resolvers.
+- `resolve_handler_identifier(request)` returns the identifier that the limiter would use for `update_route()` / `update_policy()` lookups. It requires `init_app()` or a request that already carries `scope["app"]`.
+- Endpoint identifiers are resolved in this order: endpoint function name, `route.name`, route path template without the leading slash, then `_response` / `_endpoint` suffix stripping.
 
 - `routes` exposes the currently configured bandwidth limits.
 - `policies` exposes the currently configured request-count rules.
@@ -272,7 +338,10 @@ Throttle(bytes_per_sec: int)
 
 - `per` supports `second`, `minute`, `hour`, and positive `datetime.timedelta` values.
 - `timedelta` values must be whole-second durations.
-- `scope` currently supports only `ip`.
+- `scope` supports built-in `ip` and `default`, plus custom names registered with `register_scope_resolver()`.
+- Leading and trailing whitespace in `scope` is stripped during validation.
+- `scope="ip"` always counts by the real client IP.
+- `scope="default"` uses the middleware's built-in proxy-aware client identifier, then falls back to the direct client address or `"unknown"`.
 - Action instances expose `priority`, `sort_key`, and `to_dict()`.
 - If multiple rules match the same request, the middleware evaluates those rules independently and selects a single action with the lowest `priority` value.
 - The built-in priority order is `Reject` (0), `Delay` (1), then `Throttle` (2).

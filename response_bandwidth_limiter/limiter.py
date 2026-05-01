@@ -1,8 +1,10 @@
 import logging
+import inspect
 import threading
-from typing import Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from starlette.applications import Starlette
+from starlette.requests import Request
 
 from .ip_manager import IPManager
 from .middleware import ResponseBandwidthLimiterMiddleware
@@ -10,9 +12,12 @@ from .models import Rule
 from .policy import PolicyEvaluator
 from .shutdown import ShutdownCoordinator, ShutdownMode
 from .storage import InMemoryStorage, Storage, warn_if_storage_requires_caution
+from .util import _find_configured_handler_name
 
 
 logger = logging.getLogger(__name__)
+
+ScopeResolver = Callable[[Request], Any]
 
 class ResponseBandwidthLimiter:
     """
@@ -36,7 +41,6 @@ class ResponseBandwidthLimiter:
     """
     def __init__(
         self,
-        key_func: Optional[Callable] = None,
         trusted_proxy_headers: bool = False,
         storage: Optional[Storage] = None,
     ):
@@ -47,31 +51,60 @@ class ResponseBandwidthLimiter:
         self._storage = storage or InMemoryStorage()
         self._policy_evaluator = PolicyEvaluator(storage=self._storage)
         self._ip_manager = IPManager(storage=self._storage)
-        self.key_func = key_func  # slowapi互換のため、キー関数を受け入れる
+        self._scope_resolvers: Dict[str, ScopeResolver] = {}
+        self._app: Starlette | None = None
         self.trusted_proxy_headers = trusted_proxy_headers
         self._storage_warning_emitted = False
 
+    @staticmethod
+    def _is_builtin_scope(scope_name: str) -> bool:
+        return scope_name in {"ip", "default"}
+
+    def _normalize_scope_name(self, scope_name: str) -> str:
+        if not isinstance(scope_name, str):
+            raise TypeError("scope_name must be a string.")
+        normalized_scope_name = scope_name.strip()
+        if not normalized_scope_name:
+            raise ValueError("scope_name must be a non-empty string.")
+        return normalized_scope_name
+
+    def _is_async_scope_resolver(self, resolver: ScopeResolver) -> bool:
+        if inspect.iscoroutinefunction(resolver) or inspect.isasyncgenfunction(resolver):
+            return True
+
+        call_method = getattr(resolver, "__call__", None)
+        return bool(
+            call_method
+            and (inspect.iscoroutinefunction(call_method) or inspect.isasyncgenfunction(call_method))
+        )
+
     def _validate_endpoint_name(self, endpoint_name: str) -> None:
         if not isinstance(endpoint_name, str) or not endpoint_name:
-            raise ValueError("endpoint_name は空でない文字列である必要があります。")
+            raise ValueError("endpoint_name must be a non-empty string.")
 
     def _validate_rate(self, rate: int, *, decorator_context: bool = False) -> None:
         if not isinstance(rate, int):
             if decorator_context:
-                raise TypeError("帯域制限値は整数である必要があります。例: @limiter.limit(1024)")
-            raise TypeError("帯域制限値は整数である必要があります。")
+                raise TypeError("Bandwidth limit must be an integer. Example: @limiter.limit(1024)")
+            raise TypeError("Bandwidth limit must be an integer.")
         if rate <= 0:
             if decorator_context:
-                raise ValueError("帯域制限値は1以上である必要があります。無効化する場合は設定を削除してください。")
-            raise ValueError("帯域制限値は1以上である必要があります。")
+                raise ValueError("Bandwidth limit must be greater than 0. Remove the setting to disable it.")
+            raise ValueError("Bandwidth limit must be greater than 0.")
 
     def _validate_rules(self, rules: List[Rule]) -> None:
         if not isinstance(rules, list):
-            raise TypeError("rules は Rule の配列である必要があります。")
+            raise TypeError("rules must be a list of Rule instances.")
         if not rules:
-            raise ValueError("rules は1件以上指定する必要があります。")
+            raise ValueError("rules must contain at least one item.")
         if not all(isinstance(rule, Rule) for rule in rules):
-            raise TypeError("rules には Rule のみ指定できます。")
+            raise TypeError("rules can only contain Rule instances.")
+        unknown_scopes = [rule.scope for rule in rules if not self._is_builtin_scope(rule.scope) and rule.scope not in self._scope_resolvers]
+        if unknown_scopes:
+            unique_scopes = ", ".join(sorted(set(unknown_scopes)))
+            raise ValueError(
+                f"Unknown scope(s): {unique_scopes}. Call register_scope_resolver() first."
+            )
 
     @property
     def routes(self) -> Mapping[str, int]:
@@ -99,6 +132,40 @@ class ResponseBandwidthLimiter:
     @property
     def ip_manager(self) -> IPManager:
         return self._ip_manager
+
+    def register_scope_resolver(self, scope_name: str, resolver: ScopeResolver) -> None:
+        normalized_scope_name = self._normalize_scope_name(scope_name)
+        if self._is_builtin_scope(normalized_scope_name):
+            raise ValueError(f"scope {normalized_scope_name!r} is reserved.")
+        if not callable(resolver):
+            raise TypeError("resolver must be callable.")
+        if self._is_async_scope_resolver(resolver):
+            raise TypeError("resolver must be synchronous.")
+        with self._lock:
+            if normalized_scope_name in self._scope_resolvers:
+                raise ValueError(f"scope {normalized_scope_name!r} is already registered.")
+            self._scope_resolvers[normalized_scope_name] = resolver
+
+    def _get_scope_resolver(self, scope_name: str) -> Optional[ScopeResolver]:
+        normalized_scope_name = self._normalize_scope_name(scope_name)
+        with self._lock:
+            return self._scope_resolvers.get(normalized_scope_name)
+
+    @property
+    def scope_resolvers(self) -> Mapping[str, ScopeResolver]:
+        with self._lock:
+            return dict(self._scope_resolvers)
+
+    def resolve_handler_identifier(self, request: Request) -> str | None:
+        app = request.scope.get("app", self._app)
+        if app is None:
+            raise ValueError(
+                "resolve_handler_identifier() requires init_app() or a request bound to an application."
+            )
+
+        routes = getattr(app, "routes", [])
+        path = str(request.scope.get("path", ""))
+        return _find_configured_handler_name(routes, request.scope, path, self.configured_names)
 
     def get_limit(self, endpoint_name: str) -> int | None:
         with self._lock:
@@ -215,6 +282,7 @@ class ResponseBandwidthLimiter:
             warn_if_storage_requires_caution(self._storage)
             self._storage_warning_emitted = True
 
+        self._app = app
         app.state.response_bandwidth_limiter = self
         app.add_middleware(
             ResponseBandwidthLimiterMiddleware,

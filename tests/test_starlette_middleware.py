@@ -155,6 +155,25 @@ def test_starlette_dynamic_route_resolution():
     mock_request = Request(scope={"type": "http", "app": app, "path": "/items/123", "method": "GET"})
     assert middleware.get_handler_name(mock_request, "/items/123") == "item_endpoint"
 
+
+def test_starlette_dynamic_route_resolution_accepts_route_path_identifier():
+    limiter = ResponseBandwidthLimiter()
+
+    async def item_endpoint(request):
+        return PlainTextResponse("item")
+
+    routes = [
+        Route("/items/{item_id}", endpoint=item_endpoint, name="item_endpoint"),
+    ]
+
+    app = Starlette(routes=routes)
+    limiter.update_route("items/{item_id}", 100)
+    app.state.response_bandwidth_limiter = limiter
+    middleware = ResponseBandwidthLimiterMiddleware(app)
+
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/items/123", "method": "GET"})
+    assert middleware.get_handler_name(mock_request, "/items/123") == "items/{item_id}"
+
 def test_starlette_small_plain_response_is_delayed_before_first_chunk(recorded_sleep_calls):
     limiter = ResponseBandwidthLimiter()
 
@@ -197,3 +216,28 @@ def test_starlette_policy_rejects_per_ip():
     assert rejected.json()["detail"] == "starlette limited"
 
     assert client.get("/limited", headers={"X-Forwarded-For": "10.0.0.11"}).status_code == 200
+
+
+def test_starlette_policy_supports_custom_scope_resolver():
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.register_scope_resolver("user", lambda request: request.headers.get("X-User-Id", "anonymous"))
+
+    async def limited(request):
+        return PlainTextResponse("ok")
+
+    limited = limiter.limit_rules([
+        Rule(count=1, per="second", action=Reject(detail="starlette user limited"), scope="user")
+    ])(limited)
+
+    app = Starlette(routes=[Route("/user-limited", endpoint=limited)])
+    limiter.init_app(app)
+
+    client = TestClient(app)
+
+    assert client.get("/user-limited", headers={"X-User-Id": "alpha", "X-Forwarded-For": "10.0.0.10"}).status_code == 200
+
+    rejected = client.get("/user-limited", headers={"X-User-Id": "alpha", "X-Forwarded-For": "10.0.0.11"})
+    assert rejected.status_code == 429
+    assert rejected.json()["detail"] == "starlette user limited"
+
+    assert client.get("/user-limited", headers={"X-User-Id": "beta", "X-Forwarded-For": "10.0.0.10"}).status_code == 200

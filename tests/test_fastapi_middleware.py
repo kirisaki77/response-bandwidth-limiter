@@ -144,6 +144,22 @@ def test_fastapi_dynamic_route_resolution():
     assert middleware.get_handler_name(mock_request, "/items/123") == "read_item"
 
 
+def test_fastapi_dynamic_route_resolution_accepts_route_path_identifier():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.update_route("items/{item_id}", 100)
+    app.state.response_bandwidth_limiter = limiter
+
+    @app.get("/items/{item_id}")
+    async def read_item(item_id: str):
+        return {"item_id": item_id}
+
+    middleware = ResponseBandwidthLimiterMiddleware(app)
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/items/123", "method": "GET"})
+
+    assert middleware.get_handler_name(mock_request, "/items/123") == "items/{item_id}"
+
+
 def test_fastapi_route_resolution_accepts_suffix_based_limit_name():
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
@@ -254,42 +270,39 @@ def test_policy_uses_ip_scope_independently():
     assert client.get("/ip-limited", headers={"X-Forwarded-For": "10.0.0.2"}).status_code == 200
 
 
-def test_policy_uses_key_func_instead_of_ip_headers():
+def test_policy_default_scope_uses_built_in_client_identifier():
     app = FastAPI()
-    limiter = ResponseBandwidthLimiter(key_func=lambda request: request.headers.get("X-Api-Key", "anonymous"))
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
     limiter.init_app(app)
 
-    @app.get("/key-limited")
-    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="key limited"))])
-    async def key_limited(request: Request):
+    @app.get("/default-limited")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="default limited"), scope="default")])
+    async def default_limited(request: Request):
         return PlainTextResponse("ok")
 
     client = TestClient(app)
 
-    assert client.get("/key-limited", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
-    assert client.get("/key-limited", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "10.0.0.2"}).status_code == 429
-    assert client.get("/key-limited", headers={"X-Api-Key": "beta", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
+    assert client.get("/default-limited", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
+    assert client.get("/default-limited", headers={"X-Api-Key": "beta", "X-Forwarded-For": "10.0.0.1"}).status_code == 429
+    assert client.get("/default-limited", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "10.0.0.2"}).status_code == 200
 
 
-def test_policy_falls_back_to_proxy_ip_when_key_func_raises():
+def test_policy_uses_explicit_api_key_scope_resolver():
     app = FastAPI()
-
-    def raising_key_func(request: Request) -> str:
-        raise RuntimeError("key lookup failed")
-
-    limiter = ResponseBandwidthLimiter(key_func=raising_key_func, trusted_proxy_headers=True)
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.register_scope_resolver("api_key", lambda request: request.headers.get("X-Api-Key", "anonymous"))
     limiter.init_app(app)
 
-    @app.get("/fallback-key")
-    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="fallback limited"))])
-    async def fallback_key(request: Request):
+    @app.get("/api-key-limited")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="api key limited"), scope="api_key")])
+    async def api_key_limited(request: Request):
         return PlainTextResponse("ok")
 
     client = TestClient(app)
 
-    assert client.get("/fallback-key", headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 200
-    assert client.get("/fallback-key", headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 429
-    assert client.get("/fallback-key", headers={"X-Forwarded-For": "203.0.113.11"}).status_code == 200
+    assert client.get("/api-key-limited", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
+    assert client.get("/api-key-limited", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "10.0.0.2"}).status_code == 429
+    assert client.get("/api-key-limited", headers={"X-Api-Key": "beta", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
 
 
 def test_get_client_identifier_prefers_real_ip_and_falls_back_to_scope_client():
@@ -315,9 +328,9 @@ def test_get_client_identifier_prefers_real_ip_and_falls_back_to_scope_client():
         "headers": [],
     })
 
-    assert middleware._get_client_identifier(real_ip_request, None, trust_proxy_headers=True) == "192.0.2.10"
-    assert middleware._get_client_identifier(scope_client_request, None) == "198.51.100.7"
-    assert middleware._get_client_identifier(unknown_request, None) == "unknown"
+    assert middleware._get_client_identifier(real_ip_request, trust_proxy_headers=True) == "192.0.2.10"
+    assert middleware._get_client_identifier(scope_client_request) == "198.51.100.7"
+    assert middleware._get_client_identifier(unknown_request) == "unknown"
 
 
 def test_get_client_identifier_ignores_invalid_proxy_header_values():
@@ -330,7 +343,7 @@ def test_get_client_identifier_ignores_invalid_proxy_header_values():
         "client": ("198.51.100.7", 12345),
     })
 
-    assert middleware._get_client_identifier(request, None, trust_proxy_headers=True) == "203.0.113.5"
+    assert middleware._get_client_identifier(request, trust_proxy_headers=True) == "203.0.113.5"
 
 
 def test_get_client_identifier_accepts_ipv6_proxy_headers():
@@ -343,7 +356,7 @@ def test_get_client_identifier_accepts_ipv6_proxy_headers():
         "client": ("198.51.100.7", 12345),
     })
 
-    assert middleware._get_client_identifier(request, None, trust_proxy_headers=True) == "2001:db8::10"
+    assert middleware._get_client_identifier(request, trust_proxy_headers=True) == "2001:db8::10"
 
 
 def test_get_client_identifier_ignores_proxy_headers_by_default():
@@ -356,10 +369,10 @@ def test_get_client_identifier_ignores_proxy_headers_by_default():
         "client": ("198.51.100.7", 12345),
     })
 
-    assert middleware._get_client_identifier(request, None) == "198.51.100.7"
+    assert middleware._get_client_identifier(request) == "198.51.100.7"
 
 
-def test_get_client_ip_ignores_key_func_and_uses_real_ip_sources():
+def test_get_client_ip_uses_real_ip_sources():
     middleware = ResponseBandwidthLimiterMiddleware(FastAPI())
     request = Request(scope={
         "type": "http",
@@ -407,11 +420,12 @@ def test_limiter_uses_injected_storage_for_policy_evaluation():
             return SlidingWindowResult(hit_count=1, oldest_timestamp=1.0, current_timestamp=1.0)
 
     storage = RecordingStorage()
-    limiter = ResponseBandwidthLimiter(storage=storage, key_func=lambda request: "client-1")
+    limiter = ResponseBandwidthLimiter(storage=storage)
+    limiter.register_scope_resolver("client", lambda request: "client-1")
     limiter.init_app(app)
 
     @app.get("/custom-backend")
-    @limiter.limit_rules([Rule(count=1, per="second", action=Reject())])
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(), scope="client")])
     async def custom_backend(request: Request):
         return PlainTextResponse("ok")
 
@@ -419,6 +433,91 @@ def test_limiter_uses_injected_storage_for_policy_evaluation():
 
     assert response.status_code == 200
     assert storage.calls == [("client-1", "custom_backend", 0, 1)]
+
+
+def test_policy_scope_ip_uses_real_ip():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.init_app(app)
+
+    @app.get("/strict-ip")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="ip limited"), scope="ip")])
+    async def strict_ip(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/strict-ip", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "203.0.113.10"}).status_code == 200
+    assert client.get("/strict-ip", headers={"X-Api-Key": "beta", "X-Forwarded-For": "203.0.113.10"}).status_code == 429
+    assert client.get("/strict-ip", headers={"X-Api-Key": "alpha", "X-Forwarded-For": "203.0.113.11"}).status_code == 200
+
+
+def test_policy_uses_registered_custom_scope_resolver():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.register_scope_resolver("user", lambda request: request.headers.get("X-User-Id", "anonymous"))
+    limiter.init_app(app)
+
+    @app.get("/user-limited")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="user limited"), scope="user")])
+    async def user_limited(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/user-limited", headers={"X-User-Id": "alpha", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
+    assert client.get("/user-limited", headers={"X-User-Id": "alpha", "X-Forwarded-For": "10.0.0.2"}).status_code == 429
+    assert client.get("/user-limited", headers={"X-User-Id": "beta", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
+
+
+def test_policy_mixes_ip_and_custom_scopes(recorded_sleep_calls):
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.register_scope_resolver("user", lambda request: request.headers.get("X-User-Id", "anonymous"))
+    limiter.init_app(app)
+
+    @app.get("/mixed-scope")
+    @limiter.limit_rules([
+        Rule(count=1, per="second", action=Delay(seconds=0.2), scope="user"),
+        Rule(count=1, per="second", action=Reject(detail="ip limited"), scope="ip"),
+    ])
+    async def mixed_scope(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/mixed-scope", headers={"X-User-Id": "alpha", "X-Forwarded-For": "10.0.0.1"}).status_code == 200
+
+    rejected = client.get("/mixed-scope", headers={"X-User-Id": "beta", "X-Forwarded-For": "10.0.0.1"})
+    assert rejected.status_code == 429
+    assert rejected.json()["detail"] == "ip limited"
+
+    delayed = client.get("/mixed-scope", headers={"X-User-Id": "alpha", "X-Forwarded-For": "10.0.0.2"})
+    assert delayed.status_code == 200
+    assert delayed.text == "ok"
+    assert recorded_sleep_calls == pytest.approx([0.2])
+
+
+def test_custom_scope_resolver_falls_back_to_real_ip_on_error():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+
+    def raising_resolver(request: Request) -> str:
+        raise RuntimeError("user lookup failed")
+
+    limiter.register_scope_resolver("user", raising_resolver)
+    limiter.init_app(app)
+
+    @app.get("/custom-fallback")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="fallback limited"), scope="user")])
+    async def custom_fallback(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/custom-fallback", headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 200
+    assert client.get("/custom-fallback", headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 429
+    assert client.get("/custom-fallback", headers={"X-Forwarded-For": "203.0.113.11"}).status_code == 200
 
 
 def test_fail_closed_storage_returns_503():
@@ -454,12 +553,9 @@ def test_fail_closed_storage_returns_503():
     assert response.json()["error"] == "Rate limit backend unavailable"
 
 
-def test_blocked_ip_uses_real_ip_even_when_key_func_groups_requests():
+def test_blocked_ip_uses_real_ip():
     app = FastAPI()
-    limiter = ResponseBandwidthLimiter(
-        key_func=lambda request: request.headers.get("X-Api-Key", "anonymous"),
-        trusted_proxy_headers=True,
-    )
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
     limiter.init_app(app)
 
     @app.get("/blocked")
@@ -696,3 +792,66 @@ def test_storage_unavailable_on_ip_check_returns_503():
 
     assert response.status_code == 503
     assert response.json()["error"] == "Rate limit backend unavailable"
+
+
+def test_custom_scope_resolver_returning_none_falls_back_to_ip():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.register_scope_resolver("token", lambda request: None)
+    limiter.init_app(app)
+
+    @app.get("/none-scope")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="none scope limited"), scope="token")])
+    async def none_scope(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/none-scope", headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 200
+    assert client.get("/none-scope", headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 429
+    assert client.get("/none-scope", headers={"X-Forwarded-For": "203.0.113.11"}).status_code == 200
+
+
+def test_custom_scope_resolver_returning_empty_string_falls_back_to_ip():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.register_scope_resolver("token", lambda request: "")
+    limiter.init_app(app)
+
+    @app.get("/empty-scope")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Reject(detail="empty scope limited"), scope="token")])
+    async def empty_scope(request: Request):
+        return PlainTextResponse("ok")
+
+    client = TestClient(app)
+
+    assert client.get("/empty-scope", headers={"X-Forwarded-For": "203.0.113.20"}).status_code == 200
+    assert client.get("/empty-scope", headers={"X-Forwarded-For": "203.0.113.20"}).status_code == 429
+    assert client.get("/empty-scope", headers={"X-Forwarded-For": "203.0.113.21"}).status_code == 200
+
+
+def test_starlette_mixed_ip_and_custom_scopes():
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
+    limiter.register_scope_resolver("tenant", lambda request: request.headers.get("X-Tenant", "default-tenant"))
+
+    async def mixed(request):
+        return PlainTextResponse("ok")
+
+    mixed = limiter.limit_rules([
+        Rule(count=1, per="second", action=Reject(detail="ip limited"), scope="ip"),
+        Rule(count=2, per="second", action=Reject(detail="tenant limited"), scope="tenant"),
+    ])(mixed)
+
+    app = Starlette(routes=[Route("/mixed", endpoint=mixed)])
+    limiter.init_app(app)
+
+    client = TestClient(app)
+
+    # 同一IP、異なるテナント — IPルールで制限される
+    assert client.get("/mixed", headers={"X-Forwarded-For": "10.0.0.1", "X-Tenant": "a"}).status_code == 200
+    r = client.get("/mixed", headers={"X-Forwarded-For": "10.0.0.1", "X-Tenant": "b"})
+    assert r.status_code == 429
+    assert r.json()["detail"] == "ip limited"
