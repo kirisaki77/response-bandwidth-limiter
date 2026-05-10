@@ -1,5 +1,5 @@
 # Pinned development dependencies for CI and Dependabot version updates.
-build==1.4.3
+build==1.5.0
 fastapi==0.136.0
 httpx==0.28.1
 pytest==9.0.3
