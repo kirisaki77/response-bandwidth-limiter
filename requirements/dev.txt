@@ -1,9 +1,9 @@
 # Pinned development dependencies for CI and Dependabot version updates.
-build==1.4.3
+build==1.5.0
 fastapi==0.136.0
 httpx==0.28.1
 pytest==9.0.3
-pytest-asyncio==1.3.0
+pytest-asyncio==1.4.0
 redis==7.4.0
 starlette==1.0.0
 twine==6.2.0
