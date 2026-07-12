@@ -402,6 +402,10 @@ def get_route_path(request):
 このライブラリのソースコードは以下のGitHubリポジトリで公開されています：
 https://github.com/kirisaki77/response-bandwidth-limiter
 
+## メンテナ向けドキュメント
+
+- [リリース手順](https://github.com/kirisaki77/response-bandwidth-limiter/blob/main/RELEASING.md)
+
 ## 謝辞
 
 このライブラリは [slowapi](https://github.com/laurentS/slowapi) (MIT Licensed) にインスパイアされました。

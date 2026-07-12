@@ -21,6 +21,8 @@ concurrency:
 jobs:
   verify:
     name: Verify release test suite
+    # The push event also fires when a branch or tag is deleted.
+    if: github.event.deleted == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -181,7 +183,9 @@ jobs:
 
   publish-testpypi:
     name: Publish distribution to TestPyPI
-    if: github.ref_type == 'branch'
+    if: >-
+      github.ref_type == 'branch' &&
+      github.event.deleted == false
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -207,7 +211,11 @@ jobs:
 
   publish-pypi:
     name: Publish distribution to PyPI
-    if: github.ref_type == 'tag'
+    # Only a newly created tag may publish; deletions and force-updates are rejected.
+    if: >-
+      github.ref_type == 'tag' &&
+      github.event.created == true &&
+      github.event.deleted == false
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
