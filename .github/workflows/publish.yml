@@ -1,0 +1,230 @@
+name: Publish distributions
+
+# PyPI and TestPyPI Trusted Publishers must use this workflow filename and the
+# exact GitHub Environment names declared by the publishing jobs below.
+
+run-name: Publish ${{ github.ref_name }}
+
+on:
+  push:
+    branches:
+      - 'release/v*'
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      REDIS_URL: redis://127.0.0.1:6379/0
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements/dev.txt
+
+      - name: Install pinned test dependencies
+        run: python -m pip install -r requirements/dev.txt -e ".[dev]"
+
+      - name: Run release test suite
+        run: python -m pytest -q
+
+  build:
+    name: Build and validate distribution
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements/dev.txt
+
+      - name: Install pinned build tooling
+        run: python -m pip install build==1.5.0 twine==6.2.0
+
+      - name: Verify release ref matches package version
+        env:
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+        shell: python
+        run: |
+          import os
+          import tomllib
+          from pathlib import Path
+          from packaging.version import InvalidVersion, Version
+
+          with Path("pyproject.toml").open("rb") as pyproject:
+              version = tomllib.load(pyproject)["project"]["version"]
+
+          try:
+              parsed_version = Version(version)
+          except InvalidVersion as error:
+              raise SystemExit(f"Invalid PEP 440 project version: {version!r}") from error
+
+          if str(parsed_version) != version:
+              raise SystemExit(
+                  f"Project version must use canonical PEP 440 form: {version!r}; "
+                  f"use {str(parsed_version)!r}."
+              )
+
+          if (
+              parsed_version.epoch != 0
+              or parsed_version.local is not None
+              or len(parsed_version.release) != 3
+          ):
+              raise SystemExit(
+                  "Project version must be canonical X.Y.Z PEP 440 without "
+                  f"an epoch or local segment: {version!r}."
+              )
+
+          ref_name = os.environ["RELEASE_REF_NAME"]
+          ref_type = os.environ["RELEASE_REF_TYPE"]
+
+          if ref_type == "branch":
+              expected_ref = f"release/v{version}"
+          elif ref_type == "tag":
+              expected_ref = f"v{version}"
+          else:
+              raise SystemExit(f"Unsupported Git ref type: {ref_type}")
+
+          if ref_name != expected_ref:
+              raise SystemExit(
+                  f"Release ref {ref_name!r} does not match project version "
+                  f"{version!r}; expected {expected_ref!r}."
+              )
+
+      - name: Verify production tag points to main
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Production tags must point to a commit on main."
+            exit 1
+          fi
+
+      - name: Build wheel and source distribution
+        run: python -m build --sdist --wheel
+
+      - name: Validate distribution metadata
+        run: python -m twine check --strict dist/*
+
+      - name: Verify distribution contents
+        shell: python
+        run: |
+          from pathlib import Path
+
+          dist = Path("dist")
+          files = sorted(path for path in dist.iterdir() if path.is_file())
+          wheels = [path for path in files if path.name.endswith(".whl")]
+          source_distributions = [
+              path for path in files if path.name.endswith(".tar.gz")
+          ]
+
+          if len(files) != 2 or len(wheels) != 1 or len(source_distributions) != 1:
+              names = ", ".join(path.name for path in files) or "<none>"
+              raise SystemExit(
+                  "Expected exactly one wheel and one source distribution; "
+                  f"found: {names}"
+              )
+
+      - name: Store distribution artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-testpypi:
+    name: Publish distribution to TestPyPI
+    if: github.ref_type == 'branch'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/response-bandwidth-limiter
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distribution artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distribution to TestPyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish distribution to PyPI
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/response-bandwidth-limiter
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distribution artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
