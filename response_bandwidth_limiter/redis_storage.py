@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -24,12 +25,17 @@ SLIDING_WINDOW_SCRIPT = """
 local current_time = redis.call("TIME")
 local now = tonumber(current_time[1]) + (tonumber(current_time[2]) / 1000000)
 local window_seconds = tonumber(ARGV[1])
+local max_hits = tonumber(ARGV[3])
 local threshold = now - window_seconds
 
 redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", threshold)
-redis.call("ZADD", KEYS[1], now, ARGV[2])
 
 local hit_count = redis.call("ZCARD", KEYS[1])
+if not max_hits or max_hits <= 0 or hit_count < max_hits then
+    redis.call("ZADD", KEYS[1], now, ARGV[2])
+    hit_count = redis.call("ZCARD", KEYS[1])
+end
+
 local oldest = redis.call("ZRANGE", KEYS[1], 0, 0, "WITHSCORES")
 
 redis.call("EXPIRE", KEYS[1], math.max(1, math.ceil(window_seconds)))
@@ -152,8 +158,11 @@ class RedisStorage(Storage):
         handler_name: str,
         rule_index: int,
         window_seconds: int,
+        *,
+        max_hits: int | None = None,
     ) -> SlidingWindowResult:
         counter_key = self._build_counter_key(request_key, handler_name, rule_index)
+        max_hit_entries = 0 if max_hits is None else max_hits
 
         try:
             result = await self._client.eval(
@@ -162,9 +171,17 @@ class RedisStorage(Storage):
                 counter_key,
                 str(window_seconds),
                 uuid.uuid4().hex,
+                str(max_hit_entries),
             )
         except Exception as exc:
-            return await self._handle_record_hit_failure(exc, request_key, handler_name, rule_index, window_seconds)
+            return await self._handle_record_hit_failure(
+                exc,
+                request_key,
+                handler_name,
+                rule_index,
+                window_seconds,
+                max_hits=max_hits,
+            )
 
         return self._parse_hit_result(result)
 
@@ -277,14 +294,35 @@ class RedisStorage(Storage):
         handler_name: str,
         rule_index: int,
         window_seconds: int,
+        *,
+        max_hits: int | None = None,
     ) -> SlidingWindowResult:
         if self._counter_mode() == "open":
             return SlidingWindowResult(hit_count=0, oldest_timestamp=None, current_timestamp=self._time_provider())
 
         if self._counter_mode() == "local-memory-fallback":
+            if self._storage_supports_max_hits(self._counter_fallback_storage):
+                return await self._counter_fallback_storage.record_hit(
+                    request_key,
+                    handler_name,
+                    rule_index,
+                    window_seconds,
+                    max_hits=max_hits,
+                )
             return await self._counter_fallback_storage.record_hit(request_key, handler_name, rule_index, window_seconds)
 
         raise StorageUnavailableError("Redis counter storage is unavailable.") from exc
+
+    @staticmethod
+    def _storage_supports_max_hits(storage: Storage) -> bool:
+        try:
+            parameters = inspect.signature(storage.record_hit).parameters
+        except (TypeError, ValueError):
+            return False
+        return "max_hits" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
 
     def _parse_hit_result(self, result: Any) -> SlidingWindowResult:
         if not isinstance(result, (list, tuple)) or len(result) < 3:

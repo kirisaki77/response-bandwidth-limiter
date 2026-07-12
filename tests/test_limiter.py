@@ -390,6 +390,23 @@ async def test_policy_evaluator_limits_counter_growth():
     assert len(evaluator.request_counters) == 2
 
 
+@pytest.mark.asyncio
+async def test_policy_evaluator_caps_history_after_rule_threshold():
+    storage = InMemoryStorage(time_provider=lambda: 1.0)
+    evaluator = PolicyEvaluator(storage=storage)
+    rule = Rule(count=1, per="hour", action=Reject())
+
+    decisions = [
+        await evaluator.evaluate({"ip": "client-a"}, "download", [rule])
+        for _ in range(25)
+    ]
+
+    history = next(iter(evaluator.request_counters.values()))
+    assert len(history) == 2
+    assert decisions[0] is None
+    assert sum(decision is not None for decision in decisions) == 24
+
+
 def test_action_to_dict_serialization():
     assert Throttle(bytes_per_sec=100).to_dict() == {"type": "throttle", "bytes_per_sec": 100}
     assert Delay(seconds=0.5).to_dict() == {"type": "delay", "seconds": 0.5}

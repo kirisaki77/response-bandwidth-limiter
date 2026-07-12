@@ -1,3 +1,4 @@
+import inspect
 import math
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Mapping, Optional, Tuple
@@ -33,6 +34,7 @@ class PolicyEvaluator:
         if storage is not None and not isinstance(storage, Storage):
             raise TypeError("storage must implement Storage.")
         self._storage = storage or InMemoryStorage(time_provider=time_provider, max_counters=max_counters)
+        self._record_hit_accepts_max_hits = self._supports_max_hits(self._storage)
 
     @property
     def storage(self) -> Storage:
@@ -57,7 +59,7 @@ class PolicyEvaluator:
             request_key = scope_identifiers.get(rule.scope)
             if request_key is None:
                 raise ValueError(f"No identifier was resolved for scope {rule.scope!r}.")
-            hit_result = await self._storage.record_hit(request_key, handler_name, index, rule.window_seconds)
+            hit_result = await self._record_hit(request_key, handler_name, index, rule)
             if hit_result.hit_count > rule.count:
                 retry_after = self._retry_after_seconds(
                     hit_result.oldest_timestamp,
@@ -72,6 +74,34 @@ class PolicyEvaluator:
 
         rule, retry_after = selected
         return MatchedPolicy(rule=rule, retry_after=retry_after)
+
+    @staticmethod
+    def _supports_max_hits(storage: Storage) -> bool:
+        try:
+            parameters = inspect.signature(storage.record_hit).parameters
+        except (TypeError, ValueError):
+            return False
+        return "max_hits" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    async def _record_hit(
+        self,
+        request_key: str,
+        handler_name: str,
+        rule_index: int,
+        rule: Rule,
+    ) -> SlidingWindowResult:
+        if self._record_hit_accepts_max_hits:
+            return await self._storage.record_hit(
+                request_key,
+                handler_name,
+                rule_index,
+                rule.window_seconds,
+                max_hits=rule.count + 1,
+            )
+        return await self._storage.record_hit(request_key, handler_name, rule_index, rule.window_seconds)
 
     def _select_rule_action(self, matched_actions: List[_CandidateAction]) -> Optional[Tuple[Rule, int]]:
         if not matched_actions:

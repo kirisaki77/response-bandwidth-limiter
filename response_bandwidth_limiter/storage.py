@@ -104,6 +104,8 @@ class Storage(ABC):
         handler_name: str,
         rule_index: int,
         window_seconds: int,
+        *,
+        max_hits: int | None = None,
     ) -> SlidingWindowResult:
         now = time.time()
         bucket = int(now // window_seconds)
@@ -207,7 +209,12 @@ class InMemoryStorage(Storage):
         handler_name: str,
         rule_index: int,
         window_seconds: int,
+        *,
+        max_hits: int | None = None,
     ) -> SlidingWindowResult:
+        if max_hits is not None:
+            _validate_limit("max_hits", max_hits)
+
         with self._lock:
             now = self._time_provider()
             counter_key = (request_key, handler_name, rule_index)
@@ -218,7 +225,8 @@ class InMemoryStorage(Storage):
                 self._request_counters[counter_key] = history
 
             self._cleanup_counter(history, now, window_seconds)
-            history.append(now)
+            if max_hits is None or len(history) < max_hits:
+                history.append(now)
             return SlidingWindowResult(
                 hit_count=len(history),
                 oldest_timestamp=history[0] if history else None,

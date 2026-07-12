@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse, StreamingResponse
 
-from response_bandwidth_limiter import Reject, ResponseBandwidthLimiter, Rule, ShutdownMode
+from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, Rule, ShutdownMode
 from response_bandwidth_limiter.middleware import ResponseBandwidthLimiterMiddleware
 from response_bandwidth_limiter.shutdown import ShutdownCoordinator
 from response_bandwidth_limiter.storage import InMemoryStorage
@@ -239,6 +239,70 @@ def test_shutdown_abort_stops_existing_stream_before_final_body_message():
     body_messages = [message for message in messages if message["type"] == "http.response.body"]
 
     assert [message.get("body", b"") for message in body_messages] == [b"a" * 10]
+
+
+def test_shutdown_drain_tracks_policy_delay_before_handler_execution():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.init_app(app, install_signal_handlers=False)
+    handler_calls = {"count": 0}
+
+    @app.get("/delayed")
+    @limiter.limit_rules([Rule(count=1, per="second", action=Delay(seconds=0.05))])
+    async def delayed():
+        handler_calls["count"] += 1
+        return PlainTextResponse("ok")
+
+    def make_scope() -> dict:
+        return {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/delayed",
+            "raw_path": b"/delayed",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+            "app": app,
+        }
+
+    async def run_delayed_request() -> tuple[bool, bool, list[dict], list[dict]]:
+        first_messages = []
+
+        async def send_first(message):
+            first_messages.append(message)
+
+        await app(make_scope(), build_receive_once(), send_first)
+
+        messages = []
+
+        async def send(message):
+            messages.append(message)
+
+        task = asyncio.create_task(app(make_scope(), build_receive_once(), send))
+        for _ in range(100):
+            if limiter.shutdown_coordinator.in_flight_count == 1:
+                break
+            await asyncio.sleep(0.001)
+
+        assert limiter.shutdown_coordinator.in_flight_count == 1
+        drained = await limiter.shutdown(ShutdownMode.DRAIN, timeout=0.001)
+        task_done_after_drain = task.done()
+        await task
+        return drained, task_done_after_drain, first_messages, messages
+
+    drained, task_done_after_drain, first_messages, messages = asyncio.run(run_delayed_request())
+    first_start = next(message for message in first_messages if message["type"] == "http.response.start")
+    start_message = next(message for message in messages if message["type"] == "http.response.start")
+
+    assert first_start["status"] == 200
+    assert drained is False
+    assert task_done_after_drain is False
+    assert start_message["status"] == 503
+    assert handler_calls["count"] == 1
 
 
 def test_limiter_shutdown_waits_for_drain_completion():
