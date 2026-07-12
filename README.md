@@ -403,6 +403,10 @@ def get_route_path(request):
 The source code for this library is available at the following GitHub repository:
 https://github.com/kirisaki77/response-bandwidth-limiter
 
+## Maintainer documentation
+
+- [Release process (Japanese)](https://github.com/kirisaki77/response-bandwidth-limiter/blob/main/RELEASING.md)
+
 ## Acknowledgements
 
 This library was inspired by [slowapi](https://github.com/laurentS/slowapi) (MIT Licensed).
