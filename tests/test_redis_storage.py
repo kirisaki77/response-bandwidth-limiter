@@ -123,6 +123,19 @@ async def test_redis_storage_uses_raw_request_key_tail():
 
 
 @pytest.mark.asyncio
+async def test_policy_evaluator_passes_redis_counter_cardinality_cap():
+    client = FakeRedisClient(result=[2, "10.0", "10.0"])
+    storage = RedisStorage(client)
+    evaluator = PolicyEvaluator(storage=storage)
+    rule = Rule(count=1, per="second", action=Reject())
+
+    result = await evaluator.evaluate({"ip": "client-a"}, "download", [rule])
+
+    assert result is not None
+    assert client.calls[0]["args"][3] == "2"
+
+
+@pytest.mark.asyncio
 async def test_redis_storage_cleanup_handler_counters_uses_new_local_namespace():
     client = FakeRedisCounterClient()
     storage = RedisStorage(client)

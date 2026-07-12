@@ -17,7 +17,7 @@ from .policy import MatchedPolicy, PolicyEvaluator
 from .shutdown import ShutdownCoordinator, ShutdownMode
 from .storage import StorageUnavailableError
 from .streaming import ResponseStreamer, StreamingAbortedError
-from .util import _find_configured_handler_name
+from .util import _find_configured_handler_name, _find_configured_handler_names
 
 
 logger = logging.getLogger(__name__)
@@ -289,6 +289,34 @@ class ResponseBandwidthLimiterMiddleware:
         routes = getattr(app, "routes", [])
         return _find_configured_handler_name(routes, request.scope, path, configured_names)
 
+    def get_handler_names(self, request: Request, path: str) -> list[str]:
+        app = request.scope.get("app", self.app)
+        limiter = self._get_limiter(app)
+        if limiter is None:
+            return []
+
+        routes = getattr(app, "routes", [])
+        return _find_configured_handler_names(routes, request.scope, path, limiter.configured_names)
+
+    def _select_route_limit(self, limiter: Any, handler_names: list[str]) -> tuple[str | None, int | None]:
+        for handler_name in handler_names:
+            route_limit = limiter.get_limit(handler_name)
+            if route_limit is not None:
+                return handler_name, route_limit
+        return None, None
+
+    def _select_policy_rules(self, limiter: Any, handler_names: list[str]) -> tuple[str | None, list[Rule]]:
+        for handler_name in handler_names:
+            rules = limiter.get_rules(handler_name)
+            if rules:
+                return handler_name, rules
+        return None, []
+
+    async def _sleep_for_policy_delay(self, delay_seconds: float) -> None:
+        await asyncio.sleep(delay_seconds)
+        if self.shutdown_coordinator.should_abort:
+            raise StreamingAbortedError("Policy delay was aborted.")
+
     async def _send_limited_body(
         self,
         send: Send,
@@ -369,14 +397,14 @@ class ResponseBandwidthLimiterMiddleware:
             ip_allowed = False
 
         path = scope["path"]
-        handler_name = self.get_handler_name(request, path)
+        handler_names = self.get_handler_names(request, path)
 
-        if handler_name is None:
+        if not handler_names:
             await self.app(scope, receive, send)
             return
 
-        route_limit = limiter.get_limit(handler_name)
-        rules = limiter.get_rules(handler_name)
+        _, route_limit = self._select_route_limit(limiter, handler_names)
+        policy_handler_name, rules = self._select_policy_rules(limiter, handler_names)
         if self.shutdown_coordinator.is_shutting_down and (route_limit is not None or rules):
             response = self._build_shutdown_response()
             await response(scope, receive, send)
@@ -389,14 +417,18 @@ class ResponseBandwidthLimiterMiddleware:
             except ValueError:
                 logger.error(
                     "Scope resolution failed for handler %r. Returning 503.",
-                    handler_name,
+                    policy_handler_name,
                     exc_info=True,
                 )
                 response = self._build_backend_unavailable_response()
                 await response(scope, receive, send)
                 return
             try:
-                matched_rule = None if ip_allowed else await self._evaluate_policy_rules(handler_name, rules, scope_identifiers)
+                matched_rule = None if ip_allowed else await self._evaluate_policy_rules(
+                    policy_handler_name or handler_names[0],
+                    rules,
+                    scope_identifiers,
+                )
             except StorageUnavailableError:
                 response = self._build_backend_unavailable_response()
                 await response(scope, receive, send)
@@ -408,7 +440,17 @@ class ResponseBandwidthLimiterMiddleware:
                     await response(scope, receive, send)
                     return
                 if decision.pre_delay > 0:
-                    await asyncio.sleep(decision.pre_delay)
+                    self.shutdown_coordinator.enter_response()
+                    try:
+                        await self._sleep_for_policy_delay(decision.pre_delay)
+                        if self.shutdown_coordinator.is_shutting_down:
+                            response = self._build_shutdown_response()
+                            await response(scope, receive, send)
+                            return
+                    except StreamingAbortedError:
+                        return
+                    finally:
+                        self.shutdown_coordinator.exit_response()
 
         max_rate = route_limit
         if decision is not None and decision.throttle_rate is not None:

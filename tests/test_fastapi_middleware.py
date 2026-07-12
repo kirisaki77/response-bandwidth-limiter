@@ -129,6 +129,29 @@ def test_fastapi_route_resolution():
     assert middleware.get_handler_name(mock_request, "/test") == "read_test"
 
 
+def test_policy_route_alias_applies_when_limit_uses_endpoint_name():
+    app = FastAPI()
+    limiter = ResponseBandwidthLimiter()
+    limiter.update_route("read_test", 1000)
+    limiter.update_policy("custom_name", [Rule(count=1, per="second", action=Reject(detail="route limited"))])
+    limiter.init_app(app)
+
+    @app.get("/test", name="custom_name")
+    async def read_test():
+        return PlainTextResponse("ok")
+
+    middleware = ResponseBandwidthLimiterMiddleware(app)
+    mock_request = Request(scope={"type": "http", "app": app, "path": "/test", "method": "GET"})
+    assert middleware.get_handler_names(mock_request, "/test") == ["read_test", "custom_name"]
+
+    client = TestClient(app)
+    assert client.get("/test").status_code == 200
+    rejected = client.get("/test")
+
+    assert rejected.status_code == 429
+    assert rejected.json()["detail"] == "route limited"
+
+
 def test_fastapi_dynamic_route_resolution():
     app = FastAPI()
     limiter = ResponseBandwidthLimiter()
