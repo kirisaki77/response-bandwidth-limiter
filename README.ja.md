@@ -2,41 +2,27 @@
 
 *他の言語で読む: [English](README.md), [日本語](README.ja.md)*
 
-Response Bandwidth Limiter は、FastAPI と Starlette に対してエンドポイント単位のレスポンス帯域制限と、クライアント単位の request count policy を適用するミドルウェア統合ライブラリです。
+Response Bandwidth Limiter は、FastAPIとStarletteでエンドポイントごとに転送速度の上限を設定するライブラリです。上限は各レスポンスに独立して適用されます。
+
+リクエスト数に応じた拒否・遅延・帯域制限にも対応しています。IPアドレス・APIキー・ユーザーなどの単位で集計でき、Redisを使えば複数のワーカーでカウンタを共有できます。
 
 ## インストール
 
-```bash
-pip install response-bandwidth-limiter
-```
-
-利用するフレームワークも合わせてインストールしてください。
+Python 3.10以上が必要です。以下のFastAPIの例を動かすには、ライブラリ、FastAPI、サーバーのUvicornをインストールしてください。
 
 ```bash
-pip install fastapi
-# または
-pip install starlette
+python -m pip install response-bandwidth-limiter fastapi uvicorn
 ```
 
-開発やテスト用の依存関係を含める場合:
+Starletteでの使い方は[インストールと基本的な使い方](docs/usage.ja.md)を参照してください。
 
-```bash
-pip install response-bandwidth-limiter[dev]
-```
+## 最小の使用例
 
-Redis で request count policy のカウンタをワーカー間共有したい場合:
-
-```bash
-pip install response-bandwidth-limiter[redis]
-```
-
-## 基本的な使い方
-
-### FastAPI
+次のコードを `main.py` として保存します。
 
 ```python
 from fastapi import FastAPI, Request
-from starlette.responses import FileResponse
+from starlette.responses import PlainTextResponse
 
 from response_bandwidth_limiter import ResponseBandwidthLimiter
 
@@ -44,399 +30,51 @@ app = FastAPI()
 limiter = ResponseBandwidthLimiter()
 
 @app.get("/download")
-@limiter.limit(1024)
-async def download_file(request: Request):
-    return FileResponse("path/to/large_file.txt")
-
-@app.get("/video")
-@limiter.limit(2048)
-async def stream_video(request: Request):
-    return FileResponse("path/to/video.mp4")
-
-limiter.init_app(app)
-```
-
-`init_app()` が正式な登録方法です。middleware の追加と `app.state` への保持をまとめて行います。
-
-`init_app(app, install_signal_handlers=True)` は既定で `SIGINT` と連動する shutdown 制御も有効化します。1回目の `Ctrl+C` で drain モードに入り、帯域制限または request count policy が設定されたルートへの新規リクエストは `503` で拒否し、進行中の帯域制限ストリーミング応答は継続します。2回目の `Ctrl+C` では abort モードへ昇格し、レスポンス完了まで待たずに帯域制限中の送信を停止します。shutdown を自前で制御したい場合は `install_signal_handlers=False` を指定してください。
-
-### `limit_rules` による request count policy
-
-```python
-from datetime import timedelta
-
-from fastapi import FastAPI, Request
-from starlette.responses import PlainTextResponse
-
-from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, Rule, Throttle
-
-app = FastAPI()
-limiter = ResponseBandwidthLimiter()
-
-@app.get("/download")
-@limiter.limit_rules([
-    Rule(count=10, per="second", action=Throttle(bytes_per_sec=512)),
-    Rule(count=30, per=timedelta(minutes=1), action=Delay(seconds=0.5)),
-    Rule(count=200, per=timedelta(minutes=30), action=Reject(detail="同一IPからのリクエストが多すぎます")),
-])
-async def download_file(request: Request):
+@limiter.limit(1024)  # 1024 バイト/秒
+async def download(request: Request):
     return PlainTextResponse("payload" * 4096)
 
 limiter.init_app(app)
 ```
 
-複数の rule が同じリクエストに一致した場合、middleware はそれらを独立して評価し、action は1つだけ選んで適用します。rule は上から順に実行されるわけではありません。選択には action の priority を最優先で使い、その後に `sort_key`、最後に `limit_rules([...])` 内での定義順をタイブレークとして使います。
+ルートを定義した後に `limiter.init_app(app)` を呼び出して、ミドルウェアを登録します。`/download` の各レスポンスは1,024バイト/秒に制限されます。同時に複数のレスポンスを返す場合も、それぞれに独立した上限が適用されます。
 
-たとえば、あるリクエストが `Throttle` と `Delay` の両方に一致した場合、`Throttle` の rule が先に書かれていても、実際に適用されるのは `Delay` だけです。
+`main.py` を保存したディレクトリでサーバーを起動します。
 
-利用できる action。複数一致時の選択優先順で並べています:
-
-1. `Reject(status_code=429, detail=...)`: エラー応答を返します。
-2. `Delay(seconds=...)`: エンドポイント実行前に待機します。
-3. `Throttle(bytes_per_sec=...)`: レスポンスストリームを低速化します。
-
-### Starlette
-
-```python
-from starlette.applications import Starlette
-from starlette.responses import FileResponse
-from starlette.routing import Route
-
-from response_bandwidth_limiter import ResponseBandwidthLimiter
-
-limiter = ResponseBandwidthLimiter()
-
-async def download_file(request):
-    return FileResponse("path/to/large_file.txt")
-
-routes = [
-    Route("/download", endpoint=limiter.limit(1024)(download_file)),
-]
-
-app = Starlette(routes=routes)
-limiter.init_app(app)
+```bash
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-### Redis による request count policy の共有
+ブラウザーで [http://127.0.0.1:8000/download](http://127.0.0.1:8000/download) を開きます。`payload` を繰り返した28 KiBのテキストが返り、設定した速度では転送完了まで約28秒かかります。この待ち時間は帯域制限によるものです。
 
-```python
-import os
+## 主な注意点
 
-from fastapi import FastAPI, Request
-from starlette.responses import PlainTextResponse
+- リクエスト数のカウンタとIPの許可・拒否情報は、既定ではプロセスごとに保存されます。Redisを使っても、実行時の設定更新はプロセスごとに必要です。
+- `trusted_proxy_headers` は、クライアントIPヘッダーを上書き・検証する信頼できるリバースプロキシの背後でのみ有効にしてください。
+- `init_app()` は既定で終了シグナルを処理します。アプリケーション側で終了処理を管理する場合は `install_signal_handlers=False` を指定してください。詳しくは[終了時の動作](docs/usage.ja.md#終了時の動作)を参照してください。
+- 実際の転送速度はネットワーク状況にも依存します。
 
-from response_bandwidth_limiter import RedisStorage, Reject, ResponseBandwidthLimiter, Rule
+## 詳細ドキュメント
 
-app = FastAPI()
-limiter = ResponseBandwidthLimiter(
-    storage=RedisStorage.from_url(os.environ["REDIS_URL"], counter_failure_mode="open", control_failure_mode="closed"),
-    trusted_proxy_headers=True,
-)
+| 目的 | 内容 |
+| --- | --- |
+| [インストールと基本的な使い方](docs/usage.ja.md) | FastAPI・Starletteの例、追加の依存関係、終了時の動作 |
+| [リクエスト数の制限とスコープ](docs/policies.ja.md) | `limit_rules`、アクションの優先順位、IP・APIキー・ユーザー単位の集計 |
+| [Redis・運用設定・移行](docs/operations.ja.md) | カウンタ共有、実行時更新、エンドポイントの識別子、制限事項、`key_func` からの移行 |
+| [APIリファレンス](docs/api-reference.ja.md) | 公開メソッド、ストレージ、ルール、独自アクション |
+| [開発と配布物の検証](docs/development.ja.md) | 互換性テスト、wheelの検証、リリース手順 |
 
-@app.get("/shared")
-@limiter.limit_rules([Rule(count=5, per="second", action=Reject(detail="同一IPからのリクエストが多すぎます"))])
-async def shared_policy(request: Request):
-    return PlainTextResponse("shared counter")
+実行可能なサンプルは [example/](example/) にあります。
 
-limiter.init_app(app)
-```
+## プロジェクト
 
-`RedisStorage` を使うと request count policy のカウンタを Redis に保存できるため、複数ワーカー、複数スレッド、複数サーバー間で同じ sliding-window カウンタを共有できます。Redis サーバーは 5.0 以上が必要です。IP block / allow の control data は既定で fail-closed になり、request counter 用の failure policy とは分離されています。
-
-## 実行時の設定更新
-
-設定はすべて limiter が所有します。辞書を直接変更せず、専用メソッドを使って更新してください。
-
-### 帯域制限の更新
-
-```python
-@app.get("/admin/set-limit")
-async def set_limit(endpoint: str, limit: int):
-    limiter.update_route(endpoint, limit)
-    return {"status": "success", "endpoint": endpoint, "limit": limit}
-```
-
-### policy の更新
-
-```python
-from datetime import timedelta
-
-from response_bandwidth_limiter import Delay, Reject, Rule, Throttle
-
-@app.get("/admin/set-policy")
-async def set_policy(endpoint: str, mode: str):
-    if mode == "throttle":
-        limiter.update_policy(endpoint, [
-            Rule(count=5, per="second", action=Throttle(bytes_per_sec=256)),
-            Rule(count=20, per=timedelta(minutes=30), action=Reject(detail="リクエストが多すぎます")),
-        ])
-    elif mode == "delay":
-        limiter.update_policy(endpoint, [
-            Rule(count=3, per=timedelta(seconds=1), action=Delay(seconds=0.25)),
-        ])
-    else:
-        limiter.remove_policy(endpoint)
-
-    return {"status": "success", "endpoint": endpoint}
-```
-
-### endpoint identifier の選び方
-
-`update_route()` と `update_policy()` に渡す `endpoint` は、関数名だけではなく identifier です。
-
-- limiter は identifier を、エンドポイント関数名、`route.name`、先頭の `/` を除いた route path template、`_response` または `_endpoint` で終わる関数名のベース名、の順で確認します。
-- `@limiter.limit(...)` と `@limiter.limit_rules(...)` は常にエンドポイント関数名で登録します。
-- `/items/{item_id}` のような動的ルートで route path を使う場合、identifier は `/items/123` ではなく `items/{item_id}` です。
-- `resolve_handler_identifier(request)` を使うと、`init_app()` 後にその request で実際に使われる identifier を確認できます。
-- `get_endpoint_name(request)` と `get_route_path(request)` は生の request 情報を返す helper であり、limiter の最終的な identifier と一致しない場合があります。
-
-上記の `/admin` エンドポイントは説明用の最小サンプルです。本番環境では通常の認証・認可を必ず追加してください。
-
-実行可能なサンプルは [example/main.py](example/main.py)、[example/dynamic_limit_example.py](example/dynamic_limit_example.py)、[example/redis_shared_policy_example.py](example/redis_shared_policy_example.py)、[example/ip_limiting_example.py](example/ip_limiting_example.py)、[example/custom_scope_example.py](example/custom_scope_example.py) を参照してください。
-
-## カスタム request scope
-
-`Rule.scope` ごとに、request count policy のグルーピング単位を切り替えられます。
-
-```python
-from fastapi import FastAPI, Request
-from starlette.responses import PlainTextResponse
-
-from response_bandwidth_limiter import Delay, Reject, ResponseBandwidthLimiter, Rule
-
-app = FastAPI()
-limiter = ResponseBandwidthLimiter(trusted_proxy_headers=True)
-limiter.register_scope_resolver("api_key", lambda request: request.headers.get("X-Api-Key", "anonymous"))
-limiter.register_scope_resolver("user", lambda request: request.headers.get("X-User-Id", "anonymous"))
-
-@app.get("/download")
-@limiter.limit_rules([
-    Rule(count=5, per="second", action=Reject(detail="同一IPからのリクエストが多すぎます"), scope="ip"),
-    Rule(count=20, per="minute", action=Reject(detail="同一APIキーからのリクエストが多すぎます"), scope="api_key"),
-    Rule(count=3, per="second", action=Delay(seconds=0.25), scope="user"),
-])
-async def download(request: Request):
-    return PlainTextResponse("ok")
-
-limiter.init_app(app)
-```
-
-- `scope="ip"` は middleware が解決した実 IP を常に使います。
-- `scope="default"` は middleware 組み込みの proxy-aware なクライアント識別子を使い、最後に直接接続元または `"unknown"` へフォールバックします。
-- それ以外の scope 名は、`limit_rules()` または `update_policy()` の前に `register_scope_resolver()` で登録する必要があります。
-- `register_scope_resolver()` に渡す resolver は同期関数である必要があり、同じ custom scope 名は 1 回だけ登録できます。
-- 登録済み custom resolver が例外を投げた場合、middleware は警告を出し、実 IP にフォールバックします。
-- IP block / allow は従来どおり常に実 IP を使います。
-- API キーやユーザー単位の集計は、`api_key` や `user` のような explicit な custom scope 名を使ってください。
-
-## 移行メモ
-
-- `key_func` は削除されました。
-- `scope="ip"` は strict な実 IP 集計になりました。
-- `key_func=...` の代わりに `register_scope_resolver("api_key", ...)` を登録し、rule 側で `scope="api_key"` などの explicit な custom scope 名を指定してください。
-- `scope="default"` は middleware 組み込みの proxy-aware なクライアント識別子を意味します。
-- custom scope 名は `limit_rules()` / `update_policy()` の前に登録する必要があります。
-
-## 制限事項と注意点
-
-- 帯域制限はサーバーサイドで適用されるため、実際の転送速度はネットワーク状況にも依存します。
-- request count policy と IP block / allow は既定では `InMemoryStorage` に保存されるため、分散構成でプロセス間・サーバー間共有されません。
-- `ManagerStorage` は experimental です。低速で、一貫性は保証されず、高負荷環境には不向きです。
-- `RedisStorage` を使う場合、Redis サーバーは 5.0 以上が必要です。
-- `update_policy()` と `update_route()` の実行時更新は、RedisStorage 利用時でも引き続きプロセスローカルです。
-- `scope="default"` は built-in の proxy-aware なクライアント識別子を使います。`scope="ip"` と IP block / allow は常に実 IP を使います。
-- custom scope は `limit_rules()` / `update_policy()` の前に登録する必要があります。未登録 scope は設定時に fail-fast します。
-- custom scope resolver は同期関数である必要があり、重複する scope 名は登録時に拒否されます。
-- `X-Forwarded-For` を識別に使う場合は、信頼できるリバースプロキシの背後でのみその値を信用してください。
-- 不正な proxy header 値は無視され、middleware は直接接続元のアドレスへフォールバックします。
-- 既存の Redis 共有カウンタを使う rule を `key_func` ベースの集計から `api_key` のような explicit な custom scope へ移行すると、Redis キー内の request key 部分が変わります。既存バケットはウィンドウ経過で自然に消えます。
-
-## APIリファレンス
-
-### `ResponseBandwidthLimiter`
-
-```python
-class ResponseBandwidthLimiter:
-    def __init__(self, trusted_proxy_headers: bool = False, storage: Storage | None = None): ...
-    def register_scope_resolver(self, scope_name: str, resolver: ScopeResolver): ...
-    def scope_resolvers(self) -> Mapping[str, ScopeResolver]: ...  # property
-    def resolve_handler_identifier(self, request: Request) -> str | None: ...
-    def limit(self, rate: int): ...
-    def limit_rules(self, rules: list[Rule]): ...
-    def init_app(self, app, install_signal_handlers: bool = True): ...
-    def begin_shutdown(self, mode: ShutdownMode): ...
-    async def shutdown(self, mode: ShutdownMode, timeout: float | None = None) -> bool: ...
-    async def close(self) -> None: ...
-    async def block_ip(self, ip: str, duration: int | None = None) -> None: ...
-    async def unblock_ip(self, ip: str) -> None: ...
-    async def is_blocked(self, ip: str) -> bool: ...
-    async def allow_ip(self, ip: str) -> None: ...
-    async def remove_allow(self, ip: str) -> None: ...
-    async def is_allowed(self, ip: str) -> bool: ...
-    def update_route(self, endpoint_name: str, rate: int): ...
-    def remove_route(self, endpoint_name: str): ...
-    def update_policy(self, endpoint_name: str, rules: list[Rule]): ...
-    def remove_policy(self, endpoint_name: str): ...
-    def get_limit(self, endpoint_name: str) -> int | None: ...
-    def get_rules(self, endpoint_name: str) -> list[Rule]: ...
-    @property
-    def shutdown_coordinator(self) -> ShutdownCoordinator: ...
-    @property
-    def storage(self) -> Storage: ...
-    @property
-    def ip_manager(self) -> IPManager: ...
-    @property
-    def routes(self) -> Mapping[str, int]: ...
-    @property
-    def policies(self) -> Mapping[str, list[Rule]]: ...
-    @property
-    def configured_names(self) -> set[str]: ...
-```
-
-`trusted_proxy_headers` の既定値は `False` です。`X-Forwarded-For` や `X-Real-IP` を信頼できるリバースプロキシ配下でのみ `True` にしてください。
-`storage` には request count policy と IP block / allow の保存先を指定します。省略時は `InMemoryStorage` が使われます。
-デコレータは limiter の設定だけを登録し、エンドポイントの元のシグネチャは保持されます。
-
-- `register_scope_resolver(scope_name, resolver)` は custom request-count scope を登録します。その scope を使う rule を設定する前に呼んでください。
-- resolver は同期関数である必要があり、同じ custom scope 名は 1 回だけ登録できます。
-- scope 名の前後空白は validation 時に自動で除去されます。
-- `scope_name="ip"` と `scope_name="default"` は予約済みの built-in scope で、上書きできません。
-- `scope_resolvers` は登録済みのすべての custom scope 名と resolver の読み取り専用マッピングを返します。
-- `resolve_handler_identifier(request)` は、その request に対して `update_route()` / `update_policy()` が参照する identifier を返します。`init_app()` 後、または `scope["app"]` を持つ request で使ってください。
-- endpoint identifier は、エンドポイント関数名、`route.name`、先頭の `/` を除いた route path template、`_response` / `_endpoint` suffix の順で解決されます。
-- `routes` は現在設定されている帯域制限を返します。
-- `policies` は現在設定されている request count rule を返します。
-- `configured_names` は route と policy の両方で設定済みの名前集合を返します。
-- `storage` は limiter が使用している `Storage` インスタンスを返します。
-- `ip_manager` は limiter が使用している `IPManager` インスタンスを返します。
-
-### `Storage`, `InMemoryStorage`, `ManagerStorage`, `RedisStorage`
-
-```python
-class Storage: ...
-class InMemoryStorage(Storage): ...
-class ManagerStorage(Storage): ...
-class RedisStorage(Storage): ...
-```
-
-- `InMemoryStorage` はプロセスローカルで exact sliding window を提供します。
-- `ManagerStorage` は `multiprocessing.Manager` の共有 proxy を使う簡易共有実装です。experimental で exact sliding window は保証しません。
-- `RedisStorage.from_url("redis://...")` を使うと、request count をワーカー間・サーバー間で共有できます。
-- `RedisStorage` は `counter_failure_mode="open" | "closed" | "local-memory-fallback"` と `control_failure_mode="closed" | "local-memory-fallback"` をサポートします。
-- `key_hash=True` を指定すると、Redis の request key 部分だけをハッシュ化できます。
-- `RedisStorage` は Redis サーバー 5.0 以上が必要です。
-
-### `Rule`, `Reject`, `Delay`, `Throttle`
-
-```python
-Rule(count: int, per: str | timedelta, action, scope: str = "ip")
-Reject(status_code: int = 429, detail: str = "Rate limit exceeded")
-Delay(seconds: float)
-Throttle(bytes_per_sec: int)
-```
-
-- `per` は `second`、`minute`、`hour` と、正の `datetime.timedelta` をサポートします。
-- `timedelta` は1秒単位の値だけ受け付けます。
-- `Delay.seconds` は正の有限値のみ受け付け、NaN・無限大は拒否します。ポリシーの待機中は0.1秒ごとに終了モードABORTを確認し、中断・キャンセル時には待機タスクもキャンセルします。
-- `scope` は built-in の `ip` と `default`、および `register_scope_resolver()` で登録した custom 名をサポートします。
-- `scope` の前後空白は validation 時に自動で除去されます。
-- `scope="ip"` は常に実 IP で集計します。
-- `scope="default"` は middleware 組み込みの proxy-aware なクライアント識別子を使い、最後に直接接続元または `"unknown"` へフォールバックします。
-- Action には `priority`、`sort_key`、`to_dict()` があります。
-- 複数の rule が同じリクエストに一致した場合、middleware はそれらを独立して評価し、`priority` が最も小さい action を 1 つだけ選びます。
-- 組み込み action の優先順は `Reject` (0)、`Delay` (1)、`Throttle` (2) です。
-- `priority` が同じ場合は `sort_key` が小さいほうを選びます。組み込み action では、`Delay` は待機時間が長いほう、`Throttle(bytes_per_sec=...)` は bytes-per-second が低いほうが優先されます。
-- `limit_rules([...])` の定義順はタイブレーク専用です。`priority` と `sort_key` も同じ場合だけ、先に定義された rule を選びます。
-
-独自 action を追加する場合は `ActionProtocol` を実装し、`decide()` から `PolicyDecision` を返してください。`priority` と `sort_key` は複数一致時の競合解決に使われるため、値の設計もあわせて行ってください。
-
-`ActionProtocol` には次のメンバーが必要です。
-
-- `priority: int`
-- `sort_key: int | float`
-- `to_dict() -> dict[str, Any]`
-- `decide(retry_after: int) -> PolicyDecision`
-
-`Action` も `ActionProtocol` の型エイリアスとして公開されています。
-
-`PolicyDecision` には、rule が一致したときに middleware が使う次のフィールドがあります。
-
-- `reject`: 直ちにエラーレスポンスを返すかどうか。
-- `reject_status`: reject 時に使う HTTP ステータスコード。
-- `reject_detail`: JSON ボディに返す詳細メッセージ。
-- `retry_after`: `Retry-After` ヘッダーに書き込まれる値。
-- `pre_delay`: エンドポイント実行前に適用される待機時間。
-- `throttle_rate`: レスポンスに一時的に適用される bytes-per-second 制限値。
-
-### `ResponseBandwidthLimiterMiddleware`
-
-実際に帯域制限と policy を適用する middleware です。通常は手動で追加せず、`limiter.init_app(app)` を使ってください。
-
-### ユーティリティ関数
-
-```python
-def get_endpoint_name(request):
-    """
-    リクエストからエンドポイント名を取得します
-    
-    引数:
-        request: リクエストオブジェクト
-    
-    戻り値:
-        str: エンドポイント名
-    """
-    
-def get_route_path(request):
-    """
-    リクエストからルートパスを取得します
-    
-    引数:
-        request: リクエストオブジェクト
-        
-    戻り値:
-        str: ルートパス
-    """
-```
-
-## ソースコード
-
-このライブラリのソースコードは以下のGitHubリポジトリで公開されています：
-https://github.com/kirisaki77/response-bandwidth-limiter
-
-## メンテナ向けドキュメント
-
-- [リリース手順](https://github.com/kirisaki77/response-bandwidth-limiter/blob/main/RELEASING.md)
-
-### 互換性と配布物の検証
-
-CIでは固定した開発依存関係を使い、Windows／LinuxのPython 3.10と3.14で
-全テストを実行します。別のジョブでは最低対応バージョンのStarlette 0.20.0を
-両Pythonバージョンで検証します。FastAPIやHTTPテストクライアントに依存しない
-ASGIテストで、帯域制限、マウントされた動的ルート、リクエスト数による拒否、
-実行時のポリシー削除、ファイル・ストリーミング応答、lifespan終了時の後片付けを確認します。
-
-CIと公開ワークフローでは、生成したwheelを新しい仮想環境へインストールし、
-ソースツリーをimportしない隔離モードで同じASGIテストを実行します。
-ローカルで確認する場合は、wheelが1つだけ入ったディレクトリを指定してください。
-
-```console
-python -m build
-python scripts/verify_wheel.py dist
-```
-
-実行時依存関係のインストールにはパッケージインデックスへのアクセスが必要です。
-帯域制限中のチャンクは、そのチャンク自身の待機時間が終わり次第送信されます。
-次のチャンクの待機が現在のチャンクの送信を遅らせないこと、初回送信時刻、
-送信間隔、最後のASGIボディのフラグを回帰テストで確認します。
+- [ソースコード](https://github.com/kirisaki77/response-bandwidth-limiter)
+- [PyPI](https://pypi.org/project/response-bandwidth-limiter/)
 
 ## 謝辞
 
-このライブラリは [slowapi](https://github.com/laurentS/slowapi) (MIT Licensed) にインスパイアされました。
+このライブラリは、MITライセンスで公開されている [slowapi](https://github.com/laurentS/slowapi) に着想を得ています。
 
 ## ライセンス
 
-MPL-2.0
-
-## PyPI
-
-https://pypi.org/project/response-bandwidth-limiter/
+[MPL-2.0](LICENSE)
