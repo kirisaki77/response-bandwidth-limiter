@@ -71,6 +71,12 @@ Decorators register configuration and preserve the endpoint’s original signatu
 
 Each implementation inherits from `Storage`.
 
+`InMemoryStorage(max_keys=10000)` evicts ordinary values when full, but preserves unexpired `ip:` control entries. If all slots hold IP control entries, adding a new key raises `StorageUnavailableError`; existing entries can still be updated or deleted. Increase capacity or use Redis when maintaining larger allow/block lists.
+
+`ManagerStorage` reclaims expired values on writes, including old request-counter buckets, at most once per second per storage instance. Async reads and writes run blocking Manager IPC in worker threads. Cancellation of an awaiting task does not stop an already running write. This implementation remains experimental and is not intended for high load.
+
+Custom `record_hit()` implementations return `SlidingWindowResult`. Its optional `retry_after_timestamp` is the timestamp of the hit whose expiry frees space for the next request; the evaluator adds the rule's window to calculate `Retry-After`. Omitting it preserves the `oldest_timestamp` fallback for existing storage implementations.
+
 | Class | Purpose and constraints |
 | --- | --- |
 | `InMemoryStorage` | Default process-local storage with exact sliding-window counting |

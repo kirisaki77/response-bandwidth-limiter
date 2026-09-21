@@ -73,6 +73,9 @@ def _find_configured_handler_names(
             if handler_names:
                 return handler_names
 
+        # The router executes only the first full match, even if it has no policy.
+        return []
+
     return []
 
 

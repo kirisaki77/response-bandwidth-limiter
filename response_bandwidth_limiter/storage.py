@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import threading
 import time
@@ -19,6 +20,8 @@ class SlidingWindowResult:
     hit_count: int
     oldest_timestamp: float | None
     current_timestamp: float
+    # Timestamp of the hit whose expiry makes room for the next request.
+    retry_after_timestamp: float | None = None
 
 
 class StorageUnavailableError(RuntimeError):
@@ -231,6 +234,11 @@ class InMemoryStorage(Storage):
                 hit_count=len(history),
                 oldest_timestamp=history[0] if history else None,
                 current_timestamp=now,
+                retry_after_timestamp=(
+                    history[len(history) - max_hits + 1]
+                    if max_hits is not None and max_hits > 1 and len(history) >= max_hits
+                    else None
+                ),
             )
 
     def cleanup_handler_counters(self, handler_name: str) -> None:
@@ -305,7 +313,12 @@ class InMemoryStorage(Storage):
         trim_by = max(1, self._max_keys // 10)
         target_size = max(0, self._max_keys - trim_by)
         overflow = len(self._values) - target_size
-        oldest_keys = sorted(self._last_access, key=self._last_access.get)
+        oldest_keys = sorted(
+            (candidate for candidate in self._last_access if not candidate.startswith("ip:")),
+            key=self._last_access.get,
+        )
+        if not oldest_keys:
+            raise StorageUnavailableError("In-memory storage is full of IP control entries.")
         for candidate in oldest_keys[:overflow]:
             self._delete_key(candidate)
 
@@ -342,6 +355,7 @@ class ManagerStorage(Storage):
     """
 
     _experimental = True
+    _cleanup_interval = 1.0
 
     def __init__(
         self,
@@ -356,6 +370,7 @@ class ManagerStorage(Storage):
         self._time_provider = time_provider or time.monotonic
         self._owned_manager = owned_manager
         self._closed = False
+        self._next_cleanup = float("-inf")
 
     @classmethod
     def from_manager(
@@ -367,6 +382,9 @@ class ManagerStorage(Storage):
         return cls(manager.dict(), manager.Lock(), time_provider=time_provider)
 
     async def get(self, key: str) -> Any | None:
+        return await asyncio.to_thread(self._get, key)
+
+    def _get(self, key: str) -> Any | None:
         with self._shared_lock:
             now = self._time_provider()
             if self._delete_if_expired(key, now):
@@ -375,15 +393,23 @@ class ManagerStorage(Storage):
 
     async def set(self, key: str, value: Any, expire: int | None = None) -> None:
         _validate_expire(expire)
+        await asyncio.to_thread(self._set, key, value, expire)
+
+    def _set(self, key: str, value: Any, expire: int | None) -> None:
         with self._shared_lock:
             now = self._time_provider()
+            self._cleanup_expired(now)
             self._shared_dict[key] = value
             self._set_expiry(key, now, expire)
 
     async def incr(self, key: str, expire: int | None = None) -> int:
         _validate_expire(expire)
+        return await asyncio.to_thread(self._incr, key, expire)
+
+    def _incr(self, key: str, expire: int | None) -> int:
         with self._shared_lock:
             now = self._time_provider()
+            self._cleanup_expired(now)
             self._delete_if_expired(key, now)
             current = int(self._shared_dict.get(key, 0)) + 1
             self._shared_dict[key] = current
@@ -392,6 +418,9 @@ class ManagerStorage(Storage):
             return current
 
     async def delete(self, key: str) -> None:
+        await asyncio.to_thread(self._delete, key)
+
+    def _delete(self, key: str) -> None:
         with self._shared_lock:
             self._delete_key(key)
 
@@ -425,6 +454,20 @@ class ManagerStorage(Storage):
 
     def _expiry_key(self, key: str) -> str:
         return f"{_EXPIRY_PREFIX}{key}"
+
+    def _cleanup_expired(self, now: float) -> None:
+        # Called in a worker thread under the shared lock. One snapshot avoids
+        # an IPC round trip per live key, and repeated writes skip the sweep.
+        if now < self._next_cleanup:
+            return
+        for candidate, expires_at in list(self._shared_dict.items()):
+            if (
+                isinstance(candidate, str)
+                and candidate.startswith(_EXPIRY_PREFIX)
+                and float(expires_at) <= now
+            ):
+                self._delete_key(candidate[len(_EXPIRY_PREFIX):])
+        self._next_cleanup = now + self._cleanup_interval
 
     def _set_expiry(self, key: str, now: float, expire: int | None) -> None:
         expiry_key = self._expiry_key(key)

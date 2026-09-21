@@ -37,11 +37,16 @@ if not max_hits or max_hits <= 0 or hit_count < max_hits then
 end
 
 local oldest = redis.call("ZRANGE", KEYS[1], 0, 0, "WITHSCORES")
+local retry_index = 0
+if max_hits and max_hits > 1 and hit_count >= max_hits then
+    retry_index = hit_count - max_hits + 1
+end
+local retry = redis.call("ZRANGE", KEYS[1], retry_index, retry_index, "WITHSCORES")
 
 redis.call("EXPIRE", KEYS[1], math.max(1, math.ceil(window_seconds)))
 
 if oldest[2] then
-    return {hit_count, tostring(oldest[2]), tostring(now)}
+    return {hit_count, tostring(oldest[2]), tostring(now), tostring(retry[2])}
 end
 
 return {hit_count, "", tostring(now)}
@@ -191,9 +196,10 @@ class RedisStorage(Storage):
         # Redis keys that other workers may still rely on.
         with self._state_lock:
             self._handler_generations[handler_name] = self._handler_generations.get(handler_name, 0) + 1
+        self._counter_fallback_storage.cleanup_handler_counters(handler_name)
 
     def cleanup_orphaned_counters(self, active_rules) -> None:
-        return None
+        self._counter_fallback_storage.cleanup_orphaned_counters(active_rules)
 
     def _build_data_key(self, key: str) -> str:
         return f"{self._prefix}:data:{key}"
@@ -336,6 +342,7 @@ class RedisStorage(Storage):
             hit_count=hit_count,
             oldest_timestamp=float(oldest_raw) if oldest_raw else None,
             current_timestamp=float(current_raw),
+            retry_after_timestamp=float(self._to_text(result[3])) if len(result) > 3 and result[3] else None,
         )
 
     def _to_text(self, value: Any) -> str:

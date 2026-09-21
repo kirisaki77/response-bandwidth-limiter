@@ -5,6 +5,7 @@ import pytest
 
 from response_bandwidth_limiter import InMemoryStorage, RedisStorage, Reject, Rule, SlidingWindowResult, StorageUnavailableError
 from response_bandwidth_limiter.policy import PolicyEvaluator
+from response_bandwidth_limiter import ResponseBandwidthLimiter
 
 try:
     from redis.asyncio import Redis
@@ -13,6 +14,48 @@ except ImportError:
 
 
 pytestmark = pytest.mark.skipif(Redis is None, reason="redis dependency is not installed")
+
+
+@pytest.mark.asyncio
+async def test_fallback_counters_reset_on_policy_update():
+    storage = RedisStorage(
+        FakeRedisClient(error=ConnectionError("offline")),
+        counter_failure_mode="local-memory-fallback",
+    )
+    limiter = ResponseBandwidthLimiter(storage=storage)
+    evaluator = PolicyEvaluator(storage)
+    rules = [Rule(1, "minute", Reject())]
+    limiter.update_policy("handler", rules)
+    assert await evaluator.evaluate({"ip": "a"}, "handler", rules) is None
+    assert await evaluator.evaluate({"ip": "a"}, "handler", rules) is not None
+    limiter.update_policy("handler", rules)
+    assert await evaluator.evaluate({"ip": "a"}, "handler", rules) is None
+    limiter.remove_policy("handler")
+    assert storage._counter_fallback_storage.request_counters == {}
+
+
+@pytest.mark.asyncio
+async def test_redis_retry_timestamp_is_used():
+    storage = RedisStorage(FakeRedisClient(result=[2, "0", "20", "10"]))
+    result = await PolicyEvaluator(storage).evaluate({"ip": "a"}, "handler", [Rule(1, "minute", Reject())])
+    assert result.retry_after == 50
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not os.getenv("REDIS_URL"), reason="REDIS_URL is not set")
+async def test_redis_lua_retry_after_accounts_for_rejected_hit():
+    client = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+    storage = RedisStorage(client, prefix=f"rbl-test-{uuid.uuid4().hex}")
+    key = storage._build_counter_key("a", "handler", 0)
+    try:
+        seconds, micros = await client.time()
+        now = seconds + micros / 1000000
+        await client.zadd(key, {"accepted": now - 40, "rejected": now - 20})
+        result = await PolicyEvaluator(storage).evaluate({"ip": "a"}, "handler", [Rule(1, "minute", Reject())])
+        assert 39 <= result.retry_after <= 40
+    finally:
+        await client.delete(key)
+        await storage.close()
 
 
 class FakePipeline:

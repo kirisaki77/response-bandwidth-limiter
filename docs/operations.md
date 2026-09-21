@@ -69,6 +69,10 @@ Use `resolve_handler_identifier(request)` to inspect the resolved identifier aft
 
 ## Limitations
 
+IP identifiers are normalized before counting, so equivalent IPv6 spellings share a counter. Route selection follows the router's first full match; shadowed routes do not supply policies. Limited responses disable ASGI path-send and zero-copy extensions so file data passes through the bandwidth limiter; unlimited routes retain these extensions.
+
+Policy updates reset local fallback counters as well as the local Redis counter namespace. Rejected requests can remain in the bounded sliding-window history. `Retry-After` accounts for the space needed by the next request, assuming no intervening traffic for the same rule and identifier; another matching rule may require a longer wait.
+
 - Limits are applied server-side; actual transfer speed also depends on network conditions.
 - The default `InMemoryStorage` keeps request counters and IP allow/block data within each process. It does not share state across processes or servers.
 - `ManagerStorage` is experimental and slow. It does not guarantee consistency or exact sliding-window behavior and is unsuitable for high-load environments.

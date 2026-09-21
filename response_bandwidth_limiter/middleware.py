@@ -116,7 +116,7 @@ class ResponseBandwidthLimiterMiddleware:
             if not normalized:
                 continue
             try:
-                ip_address(normalized)
+                normalized = str(ip_address(normalized))
             except ValueError:
                 continue
             return normalized
@@ -139,11 +139,11 @@ class ResponseBandwidthLimiterMiddleware:
 
         client = getattr(request, "client", None)
         if client and getattr(client, "host", None):
-            return client.host
+            return self._extract_valid_ip(str(client.host)) or client.host
 
         scope_client = request.scope.get("client")
         if scope_client:
-            return str(scope_client[0])
+            return self._extract_valid_ip(str(scope_client[0])) or str(scope_client[0])
 
         return "unknown"
 
@@ -496,10 +496,18 @@ class ResponseBandwidthLimiterMiddleware:
             )
 
         self.shutdown_coordinator.enter_response()
+        original_extensions = scope.get("extensions")
         try:
             try:
+                if original_extensions is not None:
+                    scope["extensions"] = {
+                        name: value for name, value in original_extensions.items()
+                        if name not in {"http.response.pathsend", "http.response.zerocopysend"}
+                    }
                 await self.app(scope, receive, send_with_limit)
             except StreamingAbortedError:
                 return
         finally:
+            if original_extensions is not None:
+                scope["extensions"] = original_extensions
             self.shutdown_coordinator.exit_response()

@@ -62,7 +62,8 @@ class PolicyEvaluator:
             hit_result = await self._record_hit(request_key, handler_name, index, rule)
             if hit_result.hit_count > rule.count:
                 retry_after = self._retry_after_seconds(
-                    hit_result.oldest_timestamp,
+                    hit_result.retry_after_timestamp
+                    if hit_result.retry_after_timestamp is not None else hit_result.oldest_timestamp,
                     hit_result.current_timestamp,
                     rule.window_seconds,
                 )
