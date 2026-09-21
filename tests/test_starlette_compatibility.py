@@ -4,6 +4,9 @@ No FastAPI, HTTP client, or pytest dependency is needed for this suite.
 """
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 import tempfile
 import unittest
@@ -47,6 +50,68 @@ async def request(app, path, method="GET"):
     }
     await asyncio.wait_for(app(scope, receive, send), timeout=5)
     return messages
+
+
+class StorageImportCompatibilityTests(unittest.TestCase):
+    def test_storage_exports_are_identical(self):
+        import response_bandwidth_limiter as package
+        from response_bandwidth_limiter import storage
+        from response_bandwidth_limiter.backends import base, manager, memory
+
+        for name, module in (
+            ("Storage", base),
+            ("SlidingWindowResult", base),
+            ("StorageUnavailableError", base),
+            ("InMemoryStorage", memory),
+            ("ManagerStorage", manager),
+        ):
+            with self.subTest(name=name):
+                self.assertIs(getattr(package, name), getattr(module, name))
+                self.assertIs(getattr(storage, name), getattr(module, name))
+
+    def test_routing_exports_are_identical(self):
+        import response_bandwidth_limiter as package
+        from response_bandwidth_limiter import routing, util
+
+        for name in ("get_endpoint_name", "get_route_path"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(package, name), getattr(routing, name))
+                self.assertIs(getattr(util, name), getattr(routing, name))
+
+    def test_package_import_does_not_require_redis(self):
+        import response_bandwidth_limiter as package
+
+        code = textwrap.dedent("""
+            import importlib
+            import sys
+            sys.path.insert(0, sys.argv[1])
+            sys.modules["redis"] = None
+            sys.modules["redis.asyncio"] = None
+            import response_bandwidth_limiter as package
+            from response_bandwidth_limiter.storage import InMemoryStorage, ManagerStorage
+            assert "response_bandwidth_limiter.backends.redis" not in sys.modules
+            assert "response_bandwidth_limiter.redis_storage" not in sys.modules
+            assert package.InMemoryStorage is InMemoryStorage
+            for module_name in (
+                "response_bandwidth_limiter",
+                "response_bandwidth_limiter.redis_storage",
+                "response_bandwidth_limiter.backends.redis",
+            ):
+                try:
+                    module = importlib.import_module(module_name)
+                    module.RedisStorage
+                except ImportError as exc:
+                    assert "response-bandwidth-limiter[redis]" in str(exc), str(exc)
+                else:
+                    raise AssertionError("Redis import succeeded without its dependency")
+        """)
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", code, str(Path(package.__file__).resolve().parent.parent)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class StarletteCompatibilityTests(unittest.IsolatedAsyncioTestCase):

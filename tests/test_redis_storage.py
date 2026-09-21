@@ -453,3 +453,11 @@ async def test_redis_storage_shares_counters_across_evaluators():
         if keys:
             await raw_client.delete(*keys)
         await raw_client.aclose()
+
+
+def test_redis_exports_are_identical():
+    from response_bandwidth_limiter.backends.redis import RedisStorage as BackendRedisStorage
+    from response_bandwidth_limiter.redis_storage import RedisStorage as LegacyRedisStorage
+
+    assert RedisStorage is BackendRedisStorage
+    assert LegacyRedisStorage is BackendRedisStorage

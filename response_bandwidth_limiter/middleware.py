@@ -1,24 +1,22 @@
 import asyncio
 from contextlib import suppress
 import logging
-import signal
-import threading
-from ipaddress import ip_address
 from types import FrameType
 from typing import Any, AsyncIterator, Callable, Optional
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .identity import extract_valid_ip, get_client_identifier, get_client_ip, resolve_scope_identifiers
 from .ip_manager import IPManager
 from .models import PolicyDecision, Rule
 from .policy import MatchedPolicy, PolicyEvaluator
-from .shutdown import ShutdownCoordinator, ShutdownMode
+from .shutdown import ShutdownCoordinator
+from .signals import ShutdownSignalHandler
 from .storage import StorageUnavailableError
 from .streaming import ResponseStreamer, StreamingAbortedError
-from .util import _find_configured_handler_name, _find_configured_handler_names
+from .routing import _find_configured_handler_name, _find_configured_handler_names
 
 
 logger = logging.getLogger(__name__)
@@ -47,9 +45,7 @@ class ResponseBandwidthLimiterMiddleware:
         self.response_streamer = response_streamer or ResponseStreamer(chunk_size=self.chunk_size, sleep_func=asyncio.sleep)
         self.shutdown_coordinator = shutdown_coordinator or ShutdownCoordinator()
         self.install_signal_handlers = install_signal_handlers
-        self._signal_lock = threading.Lock()
-        self._signal_handler_installed = False
-        self._original_sigint_handler: Any = None
+        self._signal_handler = ShutdownSignalHandler(self.shutdown_coordinator)
 
     async def _yield_limited_chunks(
         self,
@@ -67,105 +63,26 @@ class ResponseBandwidthLimiterMiddleware:
             yield part
 
     def _handle_sigint(self, signum: int, frame: FrameType | None) -> None:
-        next_mode = ShutdownMode.ABORT if self.shutdown_coordinator.is_shutting_down else ShutdownMode.DRAIN
-        self.shutdown_coordinator.begin_shutdown(next_mode)
-
-        with self._signal_lock:
-            original_handler = self._original_sigint_handler
-
-        if original_handler in (None, signal.SIG_IGN):
-            return
-        if original_handler == signal.SIG_DFL:
-            signal.default_int_handler(signum, frame)
-            return
-        if original_handler is self._handle_sigint:
-            return
-
-        original_handler(signum, frame)
+        self._signal_handler.handle_sigint(signum, frame)
 
     def _install_signal_handler(self) -> None:
-        if not self.install_signal_handlers:
-            return
-        if threading.current_thread() is not threading.main_thread():
-            return
-
-        with self._signal_lock:
-            if self._signal_handler_installed:
-                return
-            self._original_sigint_handler = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGINT, self._handle_sigint)
-            self._signal_handler_installed = True
+        if self.install_signal_handlers:
+            self._signal_handler.install()
 
     def _restore_signal_handler(self) -> None:
-        if threading.current_thread() is not threading.main_thread():
-            return
-
-        with self._signal_lock:
-            if not self._signal_handler_installed:
-                return
-            signal.signal(signal.SIGINT, self._original_sigint_handler)
-            self._signal_handler_installed = False
-            self._original_sigint_handler = None
+        self._signal_handler.restore()
 
     def _extract_valid_ip(self, raw_value: Optional[str]) -> Optional[str]:
-        if raw_value is None:
-            return None
+        return extract_valid_ip(raw_value)
 
-        for candidate in raw_value.split(","):
-            normalized = candidate.strip()
-            if not normalized:
-                continue
-            try:
-                normalized = str(ip_address(normalized))
-            except ValueError:
-                continue
-            return normalized
-
-        return None
-
-    def _get_client_identifier(
-        self,
-        request: Request,
-        trust_proxy_headers: bool = False,
-    ) -> str:
-        if trust_proxy_headers:
-            forwarded_ip = self._extract_valid_ip(request.headers.get("x-forwarded-for"))
-            if forwarded_ip is not None:
-                return forwarded_ip
-
-            real_ip = self._extract_valid_ip(request.headers.get("x-real-ip"))
-            if real_ip is not None:
-                return real_ip
-
-        client = getattr(request, "client", None)
-        if client and getattr(client, "host", None):
-            return self._extract_valid_ip(str(client.host)) or client.host
-
-        scope_client = request.scope.get("client")
-        if scope_client:
-            return self._extract_valid_ip(str(scope_client[0])) or str(scope_client[0])
-
-        return "unknown"
+    def _get_client_identifier(self, request: Request, trust_proxy_headers: bool = False) -> str:
+        return get_client_identifier(request, trust_proxy_headers)
 
     def _get_client_ip(self, request: Request, trust_proxy_headers: bool = False) -> str | None:
-        if trust_proxy_headers:
-            forwarded_ip = self._extract_valid_ip(request.headers.get("x-forwarded-for"))
-            if forwarded_ip is not None:
-                return forwarded_ip
+        return get_client_ip(request, trust_proxy_headers)
 
-            real_ip = self._extract_valid_ip(request.headers.get("x-real-ip"))
-            if real_ip is not None:
-                return real_ip
-
-        client = getattr(request, "client", None)
-        if client and getattr(client, "host", None):
-            return self._extract_valid_ip(str(client.host))
-
-        scope_client = request.scope.get("client")
-        if scope_client:
-            return self._extract_valid_ip(str(scope_client[0]))
-
-        return None
+    def _resolve_scope_identifiers(self, request: Request, rules: list[Rule], limiter: Any) -> dict[str, str]:
+        return resolve_scope_identifiers(request, rules, limiter)
 
     def _get_limiter(self, app: Any) -> Any:
         app_state = getattr(app, "state", None)
@@ -180,54 +97,6 @@ class ResponseBandwidthLimiterMiddleware:
         scope_identifiers: dict[str, str],
     ) -> Optional[MatchedPolicy]:
         return await self.policy_evaluator.evaluate(scope_identifiers, handler_name, rules)
-
-    def _resolve_scope_identifiers(self, request: Request, rules: list[Rule], limiter: Any) -> dict[str, str]:
-        scope_identifiers: dict[str, str] = {}
-        trust_proxy_headers = getattr(limiter, "trusted_proxy_headers", False)
-
-        for rule in rules:
-            scope_name = rule.scope
-            if scope_name in scope_identifiers:
-                continue
-
-            if scope_name == "ip":
-                scope_identifiers[scope_name] = self._get_client_ip(request, trust_proxy_headers) or "unknown"
-                continue
-
-            if scope_name == "default":
-                scope_identifiers[scope_name] = self._get_client_identifier(request, trust_proxy_headers)
-                continue
-
-            resolver = getattr(limiter, "_get_scope_resolver", None)
-            if not callable(resolver):
-                raise ValueError(f"Cannot resolve a resolver getter for scope {scope_name!r}.")
-
-            scope_resolver = resolver(scope_name)
-            if scope_resolver is None:
-                raise ValueError(f"scope {scope_name!r} is not registered.")
-
-            try:
-                resolved = scope_resolver(request)
-            except Exception:
-                logger.warning(
-                    "Scope resolver %r raised an exception. Falling back to the real client IP.",
-                    scope_name,
-                    exc_info=True,
-                )
-                scope_identifiers[scope_name] = self._get_client_ip(request, trust_proxy_headers) or "unknown"
-                continue
-
-            str_value = str(resolved) if resolved is not None else ""
-            if not str_value.strip():
-                logger.warning(
-                    "Scope resolver %r returned an empty value. Falling back to the real client IP.",
-                    scope_name,
-                )
-                scope_identifiers[scope_name] = self._get_client_ip(request, trust_proxy_headers) or "unknown"
-            else:
-                scope_identifiers[scope_name] = str_value
-
-        return scope_identifiers
 
     def _build_reject_response(self, decision: PolicyDecision) -> JSONResponse:
         headers = {"Retry-After": str(decision.retry_after)}

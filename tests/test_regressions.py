@@ -166,7 +166,7 @@ async def test_manager_storage_reclaims_old_time_buckets():
     await storage.set("permanent", "keep")
     for index in range(100):
         now[0] = float(index)
-        with patch("response_bandwidth_limiter.storage.time.time", return_value=now[0]):
+        with patch("response_bandwidth_limiter.backends.base.time.time", return_value=now[0]):
             result = await storage.record_hit("a", "handler", 0, 1)
         assert result.hit_count == 1
     assert await storage.get("permanent") == "keep"

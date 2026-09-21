@@ -42,5 +42,8 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/kirisaki77/response-bandwidth-limiter"
 
-[tool.setuptools]
-packages = ["response_bandwidth_limiter"]
+[tool.setuptools.packages.find]
+include = ["response_bandwidth_limiter", "response_bandwidth_limiter.*"]
+
+[tool.pytest.ini_options]
+markers = ["e2e: real HTTP tests against an installed package and a Uvicorn subprocess"]

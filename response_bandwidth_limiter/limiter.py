@@ -12,7 +12,7 @@ from .models import Rule
 from .policy import PolicyEvaluator
 from .shutdown import ShutdownCoordinator, ShutdownMode
 from .storage import InMemoryStorage, Storage, warn_if_storage_requires_caution
-from .util import _find_configured_handler_name
+from .routing import _find_configured_handler_name
 
 
 logger = logging.getLogger(__name__)

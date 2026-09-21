@@ -5,7 +5,7 @@ from .middleware import ResponseBandwidthLimiterMiddleware
 from .limiter import ResponseBandwidthLimiter, ScopeResolver
 from .models import Action, ActionProtocol, Delay, PolicyDecision, Reject, Rule, Throttle
 from .shutdown import ShutdownMode
-from .util import get_endpoint_name, get_route_path
+from .routing import get_endpoint_name, get_route_path
 
 __all__ = [
     "Action",
