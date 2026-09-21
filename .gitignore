@@ -175,3 +175,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local AI instructions
+/.github/copilot-instructions.md
+/.github/copilot-commit-message-instructions.md
