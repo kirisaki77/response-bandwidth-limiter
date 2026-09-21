@@ -6,6 +6,13 @@
 パッケージの公開には GitHub Actions と PyPI の Trusted Publishing（OIDC）を使用します。
 そのため、PyPI API token を GitHub Secrets に登録する必要はありません。
 
+公開前の build job は、生成した wheel を新しい仮想環境へインストールし、
+通常応答の帯域制限、ルート解決、ポリシー、ファイル・ストリーミング応答、
+lifespan の終了処理を検証します。ソースツリーを import しないよう Python の
+`-I` モードで実行し、失敗した場合は公開へ進みません。
+ローカルでは `python -m build` の後に `python scripts/verify_wheel.py dist` で
+同じ検証を実行できます。`dist` には検証対象の wheel を1つだけ置いてください。
+
 ## 公開の流れ
 
 | Git の ref | `pyproject.toml` のバージョン | 公開先 |

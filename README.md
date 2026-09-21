@@ -338,6 +338,7 @@ Throttle(bytes_per_sec: int)
 
 - `per` supports `second`, `minute`, `hour`, and positive `datetime.timedelta` values.
 - `timedelta` values must be whole-second durations.
+- `Delay.seconds` must be positive and finite; NaN and infinity are rejected. During a policy delay, shutdown ABORT is checked every 0.1 seconds, and the pending sleep is cancelled when the request is aborted or cancelled.
 - `scope` supports built-in `ip` and `default`, plus custom names registered with `register_scope_resolver()`.
 - Leading and trailing whitespace in `scope` is stripped during validation.
 - `scope="ip"` always counts by the real client IP.
@@ -406,6 +407,29 @@ https://github.com/kirisaki77/response-bandwidth-limiter
 ## Maintainer documentation
 
 - [Release process (Japanese)](https://github.com/kirisaki77/response-bandwidth-limiter/blob/main/RELEASING.md)
+
+### Compatibility and distribution checks
+
+CI runs the full suite with pinned development dependencies on Windows and Linux,
+using Python 3.10 and 3.14. A separate job checks the minimum supported Starlette
+0.20.0 on both Python versions using runtime-only ASGI tests (without FastAPI or
+an HTTP test client). These cover bandwidth limiting, mounted dynamic routes,
+request-count rejection, runtime policy removal, file and streaming responses,
+and lifespan cleanup.
+
+CI and the release workflow also install the built wheel in a fresh virtual
+environment and run the same ASGI checks with isolated Python imports. To run
+the distribution check locally, use a directory containing exactly one wheel:
+
+```console
+python -m build
+python scripts/verify_wheel.py dist
+```
+
+The check needs access to the package index to install runtime dependencies.
+Throttled body chunks are sent immediately after their own pacing delay; the
+next chunk's delay does not postpone the current chunk. Regression tests check
+first-chunk timing, subsequent send intervals, and the final ASGI body flag.
 
 ## Acknowledgements
 

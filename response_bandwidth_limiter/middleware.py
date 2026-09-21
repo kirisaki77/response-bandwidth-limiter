@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import logging
 import signal
 import threading
@@ -313,9 +314,21 @@ class ResponseBandwidthLimiterMiddleware:
         return None, []
 
     async def _sleep_for_policy_delay(self, delay_seconds: float) -> None:
-        await asyncio.sleep(delay_seconds)
-        if self.shutdown_coordinator.should_abort:
-            raise StreamingAbortedError("Policy delay was aborted.")
+        sleep_task = asyncio.create_task(asyncio.sleep(delay_seconds))
+        try:
+            while True:
+                if self.shutdown_coordinator.should_abort:
+                    raise StreamingAbortedError("Policy delay was aborted.")
+                done, _ = await asyncio.wait({sleep_task}, timeout=0.1)
+                if done:
+                    await sleep_task
+                    if self.shutdown_coordinator.should_abort:
+                        raise StreamingAbortedError("Policy delay was aborted.")
+                    return
+        finally:
+            sleep_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await sleep_task
 
     async def _send_limited_body(
         self,
@@ -326,22 +339,22 @@ class ResponseBandwidthLimiterMiddleware:
         abort_check: Callable[[], bool] | None = None,
         poll_check: Callable[[], bool] | None = None,
     ) -> None:
-        pending_chunk: Optional[bytes] = None
+        sent_bytes = 0
         async for limited_chunk in self._yield_limited_chunks(
             body,
             max_rate,
             abort_check=abort_check,
             poll_check=poll_check,
         ):
-            if pending_chunk is not None:
-                await send({"type": "http.response.body", "body": pending_chunk, "more_body": True})
-            pending_chunk = limited_chunk
+            sent_bytes += len(limited_chunk)
+            await send({
+                "type": "http.response.body",
+                "body": limited_chunk,
+                "more_body": more_body or sent_bytes < len(body),
+            })
 
-        if pending_chunk is None:
+        if sent_bytes == 0:
             await send({"type": "http.response.body", "body": body, "more_body": more_body})
-            return
-
-        await send({"type": "http.response.body", "body": pending_chunk, "more_body": more_body})
 
     async def _handle_lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
         async def receive_with_signal() -> Message:

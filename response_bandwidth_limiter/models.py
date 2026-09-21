@@ -1,4 +1,5 @@
 from datetime import timedelta
+import math
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -118,6 +119,8 @@ class Delay:
     def __post_init__(self) -> None:
         if not isinstance(self.seconds, (int, float)):
             raise TypeError("seconds must be a number.")
+        if not math.isfinite(self.seconds):
+            raise ValueError("seconds must be finite.")
         if self.seconds <= 0:
             raise ValueError("seconds must be greater than 0.")
 

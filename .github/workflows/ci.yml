@@ -49,6 +49,32 @@ jobs:
       - name: Run test suite
         run: python -m pytest -q
 
+  minimum-starlette:
+    name: Minimum Starlette (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.14']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install runtime with minimum supported Starlette
+        run: python -m pip install . "starlette==0.20.0"
+
+      - name: Validate dependencies
+        run: python -m pip check
+
+      - name: Exercise minimum-version public API
+        run: python -I tests/test_starlette_compatibility.py -v
+
   redis-integration:
     name: Redis integration (Python 3.14)
     runs-on: ubuntu-latest
@@ -117,3 +143,6 @@ jobs:
 
       - name: Validate distribution metadata
         run: python -m twine check dist/*
+
+      - name: Test installed wheel in a clean environment
+        run: python scripts/verify_wheel.py dist

@@ -337,6 +337,7 @@ Throttle(bytes_per_sec: int)
 
 - `per` は `second`、`minute`、`hour` と、正の `datetime.timedelta` をサポートします。
 - `timedelta` は1秒単位の値だけ受け付けます。
+- `Delay.seconds` は正の有限値のみ受け付け、NaN・無限大は拒否します。ポリシーの待機中は0.1秒ごとに終了モードABORTを確認し、中断・キャンセル時には待機タスクもキャンセルします。
 - `scope` は built-in の `ip` と `default`、および `register_scope_resolver()` で登録した custom 名をサポートします。
 - `scope` の前後空白は validation 時に自動で除去されます。
 - `scope="ip"` は常に実 IP で集計します。
@@ -405,6 +406,28 @@ https://github.com/kirisaki77/response-bandwidth-limiter
 ## メンテナ向けドキュメント
 
 - [リリース手順](https://github.com/kirisaki77/response-bandwidth-limiter/blob/main/RELEASING.md)
+
+### 互換性と配布物の検証
+
+CIでは固定した開発依存関係を使い、Windows／LinuxのPython 3.10と3.14で
+全テストを実行します。別のジョブでは最低対応バージョンのStarlette 0.20.0を
+両Pythonバージョンで検証します。FastAPIやHTTPテストクライアントに依存しない
+ASGIテストで、帯域制限、マウントされた動的ルート、リクエスト数による拒否、
+実行時のポリシー削除、ファイル・ストリーミング応答、lifespan終了時の後片付けを確認します。
+
+CIと公開ワークフローでは、生成したwheelを新しい仮想環境へインストールし、
+ソースツリーをimportしない隔離モードで同じASGIテストを実行します。
+ローカルで確認する場合は、wheelが1つだけ入ったディレクトリを指定してください。
+
+```console
+python -m build
+python scripts/verify_wheel.py dist
+```
+
+実行時依存関係のインストールにはパッケージインデックスへのアクセスが必要です。
+帯域制限中のチャンクは、そのチャンク自身の待機時間が終わり次第送信されます。
+次のチャンクの待機が現在のチャンクの送信を遅らせないこと、初回送信時刻、
+送信間隔、最後のASGIボディのフラグを回帰テストで確認します。
 
 ## 謝辞
 
